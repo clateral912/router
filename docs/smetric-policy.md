@@ -18,6 +18,34 @@ changes. The frozen inputs used for the differential fixtures are:
   `8cf8a3b0b2d086d84533d23e0a8960c748c17903666ab2593ebe4edcd382ef47`
 - Router main `b87c7776968ee1daf0e5eec03fec5660ec201682`
 
+## Configuration
+
+`--policy smetric` uses the built-in overload gate and Dynamo-style fallback;
+no configuration file or drain-rate calibration is required. To override
+policy options, pass one YAML file:
+
+```bash
+vllm-router --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy smetric --smetric-config /path/to/smetric.yaml
+```
+
+The file is a mapping of SMetric option names, without a `policy:` wrapper.
+Omitted fields keep their defaults, and unknown fields or invalid values fail
+startup rather than being ignored. For example:
+
+```yaml
+gate: budget_attention
+fallback: dynamo
+drain_source: measured
+drain_tps: 21400  # example cold-start rate; calibrate for your workers
+budget_gamma: 1.1
+drain_window_secs: 300
+drain_min_samples: 8
+```
+
+The same file applies when SMetric is selected with `--prefill-policy` or
+`--decode-policy` in PD mode. It does not change other policies.
+
 The community default uses the overload gate (`2.0`), hit ratio `0.5`, and
 the Dynamo-style fallback without a service dependency. This differs from the
 Python Figure 13 prototype's load fallback; the reference fixtures explicitly

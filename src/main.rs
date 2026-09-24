@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, SMetricDrainSource,
-    SMetricFallback, SMetricGate, SMetricPolicyConfig, TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, SMetricPolicyConfig,
+    TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -180,69 +180,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
 
-    /// SMetric gate. Defaults reproduce the Fig. 13 prototype.
-    #[arg(long, value_enum, default_value_t = SMetricGate::Overload)]
-    smetric_gate: SMetricGate,
-    #[arg(long, default_value_t = 2.0)]
-    smetric_overload_factor: f64,
-    #[arg(long, default_value_t = 0.5)]
-    smetric_hit_ratio: f64,
-    #[arg(long, default_value_t = 1.0)]
-    smetric_budget_gamma: f64,
-    #[arg(long, default_value_t = 2300.0)]
-    smetric_drain_tps: f64,
-    #[arg(long, value_enum, default_value_t = SMetricDrainSource::Config)]
-    smetric_drain_source: SMetricDrainSource,
-    #[arg(long, default_value_t = false)]
-    smetric_store_pricing: bool,
-    #[arg(long, default_value_t = false)]
-    smetric_queue_store_pricing: bool,
-    #[arg(long, default_value_t = false)]
-    smetric_service_time_routing: bool,
-    #[arg(long, default_value_t = 0.28)]
-    smetric_service_fixed_s: f64,
-    #[arg(long)]
-    smetric_home_quiet_stick: Option<usize>,
-    #[arg(long)]
-    smetric_session_home_depth: Option<usize>,
-    #[arg(long, default_value_t = false)]
-    smetric_store_rescue: bool,
-    #[arg(long, default_value_t = 162000.0)]
-    smetric_store_load_tps: f64,
-    #[arg(long, default_value_t = false)]
-    smetric_contract_safe: bool,
-    #[arg(long, default_value_t = 1.0)]
-    smetric_slo_base_s: f64,
-    #[arg(long, default_value_t = 8000.0)]
-    smetric_slo_input_tokens_per_s: f64,
-    #[arg(long, default_value_t = 0.030)]
-    smetric_slo_tpot_s: f64,
-    #[arg(long, default_value_t = 1.0)]
-    smetric_budget_base_s: f64,
-    #[arg(long, default_value_t = 16000.0)]
-    smetric_budget_input_tokens_per_s: f64,
-    #[arg(long, value_enum, default_value_t = SMetricFallback::Dynamo)]
-    smetric_fallback: SMetricFallback,
-    #[arg(long, default_value_t = 6923.0)]
-    smetric_attention_l_eq: f64,
-    #[arg(long, default_value_t = 16)]
-    smetric_block_size: usize,
-    #[arg(long, default_value_t = 1.0)]
-    smetric_prefill_load_scale: f64,
-    #[arg(long, default_value_t = 0.0)]
-    smetric_decode_active_request_weight: f64,
-    #[arg(long, default_value_t = 1.0)]
-    smetric_overlap_score_credit: f64,
-    #[arg(long, default_value_t = 0.0)]
-    smetric_overlap_score_credit_decay: f64,
-    #[arg(long, default_value_t = 0.0)]
-    smetric_host_cache_hit_weight: f64,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
-    smetric_track_prefill_tokens: bool,
-    #[arg(long, default_value_t = 180)]
-    smetric_drain_window_secs: u64,
-    #[arg(long, default_value_t = 5)]
-    smetric_drain_min_samples: usize,
+    /// YAML file overriding SMetric policy defaults (used with --policy smetric).
+    #[arg(long, value_name = "PATH")]
+    smetric_config: Option<std::path::PathBuf>,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -453,7 +393,7 @@ impl CliArgs {
     }
 
     /// Convert policy string to PolicyConfig
-    fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
+    fn parse_policy(&self, policy_str: &str, smetric_config: &SMetricPolicyConfig) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
@@ -471,43 +411,34 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
-            "smetric" => PolicyConfig::SMetric(Box::new(SMetricPolicyConfig {
-                overload_factor: self.smetric_overload_factor,
-                hit_ratio: self.smetric_hit_ratio,
-                gate: self.smetric_gate,
-                budget_gamma: self.smetric_budget_gamma,
-                drain_tps: self.smetric_drain_tps,
-                drain_source: self.smetric_drain_source,
-                store_pricing: self.smetric_store_pricing,
-                queue_store_pricing: self.smetric_queue_store_pricing,
-                service_time_routing: self.smetric_service_time_routing,
-                service_fixed_s: self.smetric_service_fixed_s,
-                home_quiet_stick: self.smetric_home_quiet_stick,
-                session_home_depth: self.smetric_session_home_depth,
-                store_rescue: self.smetric_store_rescue,
-                store_load_tps: self.smetric_store_load_tps,
-                contract_safe: self.smetric_contract_safe,
-                slo_base_s: self.smetric_slo_base_s,
-                slo_input_tokens_per_s: self.smetric_slo_input_tokens_per_s,
-                slo_tpot_s: self.smetric_slo_tpot_s,
-                budget_base_s: self.smetric_budget_base_s,
-                budget_input_tokens_per_s: self.smetric_budget_input_tokens_per_s,
-                fallback: self.smetric_fallback,
-                attention_l_eq: self.smetric_attention_l_eq,
-                block_size: self.smetric_block_size,
-                prefill_load_scale: self.smetric_prefill_load_scale,
-                decode_active_request_weight: self.smetric_decode_active_request_weight,
-                overlap_score_credit: self.smetric_overlap_score_credit,
-                overlap_score_credit_decay: self.smetric_overlap_score_credit_decay,
-                host_cache_hit_weight: self.smetric_host_cache_hit_weight,
-                track_prefill_tokens: self.smetric_track_prefill_tokens,
-                eviction_interval_secs: self.eviction_interval,
-                max_tree_size: self.max_tree_size,
-                drain_window_secs: self.smetric_drain_window_secs,
-                drain_min_samples: self.smetric_drain_min_samples,
-            })),
+            "smetric" => PolicyConfig::SMetric(Box::new(smetric_config.clone())),
             _ => PolicyConfig::RoundRobin, // Fallback
         }
+    }
+
+    fn load_smetric_config(&self) -> ConfigResult<SMetricPolicyConfig> {
+        let Some(path) = &self.smetric_config else {
+            return Ok(SMetricPolicyConfig::default());
+        };
+        if self.policy != "smetric"
+            && !(self.vllm_pd_disaggregation
+                && (self.prefill_policy.as_deref() == Some("smetric")
+                    || self.decode_policy.as_deref() == Some("smetric")))
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--smetric-config requires an active smetric policy".to_string(),
+            });
+        }
+        let bytes = std::fs::read(path).map_err(|error| ConfigError::InvalidValue {
+            field: "smetric_config".to_string(),
+            value: path.display().to_string(),
+            reason: format!("cannot read file: {error}"),
+        })?;
+        serde_yaml::from_slice(&bytes).map_err(|error| ConfigError::InvalidValue {
+            field: "smetric_config".to_string(),
+            value: path.display().to_string(),
+            reason: format!("invalid YAML: {error}"),
+        })
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -515,6 +446,7 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        let smetric_config = self.load_smetric_config()?;
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -576,8 +508,14 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p, &smetric_config)),
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p, &smetric_config)),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -594,7 +532,7 @@ impl CliArgs {
         };
 
         // Main policy
-        let policy = self.parse_policy(&self.policy);
+        let policy = self.parse_policy(&self.policy, &smetric_config);
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -942,5 +880,96 @@ mod tests {
 
         assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
         assert_eq!(other, ["vllm-router", "65536"]);
+    }
+
+    #[test]
+    fn smetric_yaml_overrides_defaults_for_main_and_pd_prefill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smetric.yaml");
+        std::fs::write(
+            &path,
+            "gate: budget_attention\ndrain_source: measured\ndrain_tps: 21400\nbudget_gamma: 1.1\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+
+        let regular = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://worker:8000",
+            "--policy",
+            "smetric",
+            "--smetric-config",
+            path,
+        ])
+        .unwrap()
+        .to_router_config(vec![])
+        .unwrap();
+        let PolicyConfig::SMetric(config) = regular.policy else {
+            panic!("smetric policy was not selected");
+        };
+        assert_eq!(
+            config.gate,
+            vllm_router_rs::config::SMetricGate::BudgetAttention
+        );
+        assert_eq!(
+            config.fallback,
+            vllm_router_rs::config::SMetricFallback::Dynamo
+        );
+        assert_eq!(
+            config.drain_source,
+            vllm_router_rs::config::SMetricDrainSource::Measured
+        );
+        assert_eq!(config.drain_tps, 21_400.0);
+
+        let pd = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--vllm-discovery-address",
+            "0.0.0.0:30001",
+            "--policy",
+            "random",
+            "--prefill-policy",
+            "smetric",
+            "--smetric-config",
+            path,
+        ])
+        .unwrap()
+        .to_router_config(vec![])
+        .unwrap();
+        assert!(matches!(pd.policy, PolicyConfig::Random));
+        let RoutingMode::VllmPrefillDecode {
+            prefill_policy: Some(PolicyConfig::SMetric(config)),
+            decode_policy: None,
+            ..
+        } = pd.mode
+        else {
+            panic!("prefill-only smetric was not selected");
+        };
+        assert_eq!(
+            config.gate,
+            vllm_router_rs::config::SMetricGate::BudgetAttention
+        );
+    }
+
+    #[test]
+    fn smetric_yaml_rejects_unknown_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smetric.yaml");
+        std::fs::write(&path, "overlod_factor: 3\n").unwrap();
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://worker:8000",
+            "--policy",
+            "smetric",
+            "--smetric-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.to_router_config(vec![]),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "smetric_config"
+        ));
     }
 }

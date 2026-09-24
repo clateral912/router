@@ -721,7 +721,7 @@ pub enum SMetricDrainSource {
 /// intentionally separate so selecting `smetric` never silently selects one
 /// of the 30B/235B production arms.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SMetricPolicyConfig {
     pub overload_factor: f64,
     pub hit_ratio: f64,
