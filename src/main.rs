@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, SMetricPolicyConfig,
+    TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -117,7 +118,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -144,11 +145,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -178,6 +179,10 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// YAML file overriding SMetric policy defaults (used with --policy smetric).
+    #[arg(long, value_name = "PATH")]
+    smetric_config: Option<std::path::PathBuf>,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -388,7 +393,7 @@ impl CliArgs {
     }
 
     /// Convert policy string to PolicyConfig
-    fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
+    fn parse_policy(&self, policy_str: &str, smetric_config: &SMetricPolicyConfig) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
@@ -406,8 +411,34 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
+            "smetric" => PolicyConfig::SMetric(Box::new(smetric_config.clone())),
             _ => PolicyConfig::RoundRobin, // Fallback
         }
+    }
+
+    fn load_smetric_config(&self) -> ConfigResult<SMetricPolicyConfig> {
+        let Some(path) = &self.smetric_config else {
+            return Ok(SMetricPolicyConfig::default());
+        };
+        if self.policy != "smetric"
+            && !(self.vllm_pd_disaggregation
+                && (self.prefill_policy.as_deref() == Some("smetric")
+                    || self.decode_policy.as_deref() == Some("smetric")))
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--smetric-config requires an active smetric policy".to_string(),
+            });
+        }
+        let bytes = std::fs::read(path).map_err(|error| ConfigError::InvalidValue {
+            field: "smetric_config".to_string(),
+            value: path.display().to_string(),
+            reason: format!("cannot read file: {error}"),
+        })?;
+        serde_yaml::from_slice(&bytes).map_err(|error| ConfigError::InvalidValue {
+            field: "smetric_config".to_string(),
+            value: path.display().to_string(),
+            reason: format!("invalid YAML: {error}"),
+        })
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -415,6 +446,7 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        let smetric_config = self.load_smetric_config()?;
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -476,8 +508,14 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p, &smetric_config)),
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p, &smetric_config)),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -494,7 +532,7 @@ impl CliArgs {
         };
 
         // Main policy
-        let policy = self.parse_policy(&self.policy);
+        let policy = self.parse_policy(&self.policy, &smetric_config);
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -842,5 +880,96 @@ mod tests {
 
         assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
         assert_eq!(other, ["vllm-router", "65536"]);
+    }
+
+    #[test]
+    fn smetric_yaml_overrides_defaults_for_main_and_pd_prefill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smetric.yaml");
+        std::fs::write(
+            &path,
+            "gate: budget_attention\ndrain_source: measured\ndrain_tps: 21400\nbudget_gamma: 1.1\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+
+        let regular = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://worker:8000",
+            "--policy",
+            "smetric",
+            "--smetric-config",
+            path,
+        ])
+        .unwrap()
+        .to_router_config(vec![])
+        .unwrap();
+        let PolicyConfig::SMetric(config) = regular.policy else {
+            panic!("smetric policy was not selected");
+        };
+        assert_eq!(
+            config.gate,
+            vllm_router_rs::config::SMetricGate::BudgetAttention
+        );
+        assert_eq!(
+            config.fallback,
+            vllm_router_rs::config::SMetricFallback::Dynamo
+        );
+        assert_eq!(
+            config.drain_source,
+            vllm_router_rs::config::SMetricDrainSource::Measured
+        );
+        assert_eq!(config.drain_tps, 21_400.0);
+
+        let pd = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--vllm-discovery-address",
+            "0.0.0.0:30001",
+            "--policy",
+            "random",
+            "--prefill-policy",
+            "smetric",
+            "--smetric-config",
+            path,
+        ])
+        .unwrap()
+        .to_router_config(vec![])
+        .unwrap();
+        assert!(matches!(pd.policy, PolicyConfig::Random));
+        let RoutingMode::VllmPrefillDecode {
+            prefill_policy: Some(PolicyConfig::SMetric(config)),
+            decode_policy: None,
+            ..
+        } = pd.mode
+        else {
+            panic!("prefill-only smetric was not selected");
+        };
+        assert_eq!(
+            config.gate,
+            vllm_router_rs::config::SMetricGate::BudgetAttention
+        );
+    }
+
+    #[test]
+    fn smetric_yaml_rejects_unknown_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smetric.yaml");
+        std::fs::write(&path, "overlod_factor: 3\n").unwrap();
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://worker:8000",
+            "--policy",
+            "smetric",
+            "--smetric-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.to_router_config(vec![]),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "smetric_config"
+        ));
     }
 }

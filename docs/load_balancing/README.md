@@ -14,6 +14,11 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
+| `smetric` | Agentic multi-turn routing with conditional cache affinity | Yes (cache-based) | Yes |
+
+`smetric` runs with built-in defaults; optional overrides use a single
+`--smetric-config /path/to/smetric.yaml` file. See the
+[SMetric configuration and behavior reference](../smetric-policy.md).
 
 ---
 

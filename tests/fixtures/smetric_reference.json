@@ -1,0 +1,742 @@
+{
+  "cases": [
+    {
+      "config": {
+        "overload": 2.0
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 16000,
+          "pending_prefill_tokens": 32000
+        },
+        {
+          "cache_hit_tokens": 0,
+          "pending_prefill_tokens": 8000
+        },
+        {
+          "cache_hit_tokens": 0,
+          "pending_prefill_tokens": 8000
+        }
+      ],
+      "name": "overload_boundary_inclusive",
+      "request": {
+        "input_length": 16000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "overload": 2.0
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load_rr",
+      "instances": [
+        {
+          "cache_hit_tokens": 16000,
+          "pending_prefill_tokens": 48000
+        },
+        {
+          "cache_hit_tokens": 0
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "overload_spill_load_rr",
+      "request": {
+        "input_length": 16000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 1000,
+        "gate": "budget"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 15000,
+          "pending_prefill_tokens": 1000
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "budget_raw_fits",
+      "request": {
+        "input_length": 16000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 1000,
+        "gate": "budget"
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "cache_hit_tokens": 15000,
+          "pending_prefill_tokens": 1001
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "budget_raw_spills",
+      "request": {
+        "input_length": 16000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 21400,
+        "gate": "budget_attention"
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "cache_hit_tokens": 60000,
+          "pending_prefill_attention": 0.0,
+          "pending_prefill_tokens": 100000
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "budget_attention_spills",
+      "request": {
+        "input_length": 64000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "fallback": "lmetric"
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_lmetric",
+      "instances": [
+        {
+          "num_requests": 4
+        },
+        {
+          "num_requests": 1,
+          "pending_prefill_tokens": 100
+        }
+      ],
+      "name": "lmetric",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "prefill_work_attention"
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_prefill_work_attention",
+      "instances": [
+        {
+          "pending_prefill_attention": 50000000.0,
+          "pending_prefill_tokens": 1000
+        },
+        {
+          "pending_prefill_tokens": 3000
+        }
+      ],
+      "name": "prefill_work_attention",
+      "request": {
+        "input_length": 4000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "lmetric_attention"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_lmetric_attention",
+      "instances": [
+        {
+          "num_requests": 1,
+          "pending_prefill_attention": 50000000.0,
+          "pending_prefill_tokens": 1000
+        },
+        {
+          "num_requests": 3,
+          "pending_prefill_tokens": 3000
+        }
+      ],
+      "name": "lmetric_attention",
+      "request": {
+        "input_length": 4000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "dynamo",
+        "overlap_score_credit_decay": 1.0
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_dynamo_prefill_router",
+      "instances": [
+        {
+          "cache_hit_tokens": 1200,
+          "ongoing_decode_tokens": 0,
+          "pending_prefill_tokens": 3200
+        },
+        {
+          "cache_hit_tokens": 0,
+          "ongoing_decode_tokens": 160,
+          "pending_prefill_tokens": 0
+        }
+      ],
+      "name": "dynamo",
+      "request": {
+        "input_length": 1600,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "dynamo_logit"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_dynamo_prefill_router",
+      "instances": [
+        {
+          "cache_hit_tokens": 1200
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "dynamo_logit_alias",
+      "request": {
+        "input_length": 1600,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "attention_l_eq": 13568,
+        "contract_safe": true,
+        "drain_tps": 13100,
+        "fallback": "lmetric_attention",
+        "gate": "budget_attention"
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_lmetric_attention_contract_safe",
+      "instances": [
+        {
+          "decode_contracts": [
+            {
+              "elapsed_s": 0.5,
+              "emitted_tokens": 10,
+              "input_length": 1000
+            }
+          ],
+          "num_requests": 1,
+          "pending_prefill_tokens": 1000
+        },
+        {
+          "num_requests": 1,
+          "pending_prefill_tokens": 90000
+        }
+      ],
+      "name": "contract_safe_filters",
+      "request": {
+        "input_length": 40000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "attention_l_eq": 13568,
+        "contract_safe": true,
+        "drain_tps": 13100,
+        "fallback": "lmetric_attention",
+        "gate": "budget_attention"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_lmetric_attention_no_safe_engine",
+      "instances": [
+        {
+          "decode_contracts": [
+            {
+              "elapsed_s": 0.5,
+              "emitted_tokens": 10,
+              "input_length": 1000
+            }
+          ],
+          "num_requests": 1,
+          "pending_prefill_tokens": 1000
+        },
+        {
+          "decode_contracts": [
+            {
+              "elapsed_s": 0.5,
+              "emitted_tokens": 10,
+              "input_length": 1000
+            }
+          ],
+          "num_requests": 1,
+          "pending_prefill_tokens": 90000
+        }
+      ],
+      "name": "contract_safe_no_candidate",
+      "request": {
+        "input_length": 40000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 21400,
+        "fallback": "prefill_work_attention",
+        "gate": "budget_attention",
+        "store_rescue": true
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_prefill_work_attention_store_rescue",
+      "instances": [
+        {
+          "cache_hit_tokens": 60000,
+          "pending_prefill_tokens": 100000,
+          "store_hit_tokens": 60000
+        },
+        {
+          "cache_hit_tokens": 0,
+          "store_hit_tokens": 60000
+        }
+      ],
+      "name": "store_rescue",
+      "request": {
+        "input_length": 64000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "drain_source": "measured",
+        "drain_tps": 1000,
+        "gate": "budget_attention"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 15000,
+          "est_prefill_work_tps": 10000,
+          "pending_prefill_tokens": 3000
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "measured_attention_rate",
+      "request": {
+        "input_length": 16000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "service_time_routing": true
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_service_move",
+      "instances": [
+        {
+          "cache_hit_tokens": 0
+        },
+        {
+          "cache_hit_tokens": 4000
+        }
+      ],
+      "name": "service_time_cold",
+      "request": {
+        "input_length": 8000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "hit_ratio": 0.5
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "cache_hit_tokens": 500,
+          "pending_prefill_tokens": 100
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "hit_ratio_is_strict",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "prefill_load_scale": 4.0
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "pending_prefill_tokens": 16
+        },
+        {
+          "ongoing_decode_tokens": 48
+        }
+      ],
+      "name": "prefill_scale_does_not_scale_decode",
+      "request": {
+        "input_length": 100,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "decode_active_request_weight": 1.0
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "num_requests": 3
+        },
+        {
+          "pending_prefill_tokens": 16
+        }
+      ],
+      "name": "decode_active_request_weight",
+      "request": {
+        "input_length": 100,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "attention_l_eq": 1000000000,
+        "fallback": "prefill_work_attention",
+        "store_pricing": true
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_prefill_work_attention",
+      "instances": [
+        {
+          "store_hit_tokens": 800
+        },
+        {
+          "cache_hit_tokens": 500,
+          "pending_prefill_tokens": 50,
+          "store_hit_tokens": 800
+        }
+      ],
+      "name": "store_pricing_changes_own_work",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 1000,
+        "gate": "budget_attention",
+        "queue_store_pricing": true,
+        "store_load_tps": 100000
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 1000,
+          "pending_prefill_tokens": 1000,
+          "pending_store_tokens": 1000
+        },
+        {}
+      ],
+      "name": "queue_store_pricing",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "attention_l_eq": 1000,
+        "drain_tps": 1000,
+        "gate": "budget_attention"
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "cache_hit_tokens": 1000,
+          "pending_prefill_attention": 100000,
+          "pending_prefill_tokens": 100,
+          "real_pending_prefill_tokens": 1000
+        },
+        {}
+      ],
+      "name": "engine_feed_scales_shadow_attention",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "decode_active_request_weight": 2.0,
+        "prefill_load_scale": 3.0
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "num_requests": 1,
+          "ongoing_decode_tokens": 16,
+          "pending_prefill_tokens": 16,
+          "real_inflight": 3,
+          "real_ongoing_decode_tokens": 64
+        },
+        {
+          "pending_prefill_tokens": 64
+        }
+      ],
+      "name": "engine_feed_blends_decode_and_requests",
+      "request": {
+        "input_length": 100,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "dynamo",
+        "overlap_score_credit_decay": 2.0
+      },
+      "expected_position": 1,
+      "expected_reason": "smetric_fallback_dynamo_prefill_router",
+      "instances": [
+        {
+          "cache_hit_tokens": 1200,
+          "ongoing_decode_tokens": 16000,
+          "pending_prefill_tokens": 1600
+        },
+        {
+          "ongoing_decode_tokens": 0,
+          "pending_prefill_tokens": 0
+        }
+      ],
+      "name": "dynamo_decay_ignores_decode",
+      "request": {
+        "input_length": 1600,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "dynamo",
+        "track_prefill_tokens": false
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_dynamo_prefill_router_rr",
+      "instances": [
+        {
+          "cache_hit_tokens": 1200,
+          "pending_prefill_tokens": 16000
+        },
+        {
+          "cache_hit_tokens": 0
+        }
+      ],
+      "name": "dynamo_track_prefill_disabled",
+      "request": {
+        "input_length": 1600,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "fallback": "dynamo",
+        "host_cache_hit_weight": 1.0
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_dynamo_prefill_router",
+      "instances": [
+        {
+          "store_hit_tokens": 1200
+        },
+        {}
+      ],
+      "name": "dynamo_host_credit",
+      "request": {
+        "input_length": 1600,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "contract_safe": true,
+        "fallback": "dynamo"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_dynamo_prefill_router_rr",
+      "instances": [
+        {
+          "decode_contracts": [
+            {
+              "elapsed_s": 0.5,
+              "emitted_tokens": 10,
+              "input_length": 1000
+            }
+          ]
+        },
+        {},
+        {}
+      ],
+      "name": "dynamo_rr_precedes_contract_suffix",
+      "request": {
+        "input_length": 100,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 1,
+        "gate": "budget",
+        "home_quiet_stick": 1
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 100,
+          "pending_prefill_tokens": 1000,
+          "real_inflight": 1
+        },
+        {}
+      ],
+      "name": "home_quiet_uses_fresh_engine_only",
+      "request": {
+        "input_length": 100,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "budget_gamma": 0.0,
+        "gate": "budget"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 100
+        },
+        {}
+      ],
+      "name": "budget_gamma_zero_inclusive",
+      "request": {
+        "input_length": 100,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "drain_source": "measured",
+        "drain_tps": 1000,
+        "gate": "budget"
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_stick",
+      "instances": [
+        {
+          "cache_hit_tokens": 1000,
+          "est_prefill_tps": 10000,
+          "pending_prefill_tokens": 3000
+        },
+        {}
+      ],
+      "name": "measured_token_rate",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 2
+      }
+    },
+    {
+      "config": {
+        "contract_safe": true
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_load",
+      "instances": [
+        {
+          "decode_contracts": [
+            {
+              "elapsed_s": 10.0,
+              "emitted_tokens": 0,
+              "input_length": 100
+            }
+          ]
+        },
+        {
+          "pending_prefill_tokens": 100
+        }
+      ],
+      "name": "contract_already_blown_is_exempt",
+      "request": {
+        "input_length": 1000,
+        "turn_depth": 1
+      }
+    },
+    {
+      "config": {
+        "drain_tps": 1000,
+        "fallback": "prefill_work_attention",
+        "gate": "budget_attention",
+        "store_rescue": true
+      },
+      "expected_position": 0,
+      "expected_reason": "smetric_fallback_prefill_work_attention",
+      "instances": [
+        {
+          "cache_hit_tokens": 60000,
+          "pending_prefill_tokens": 100000
+        },
+        {}
+      ],
+      "name": "store_rescue_no_feasible_store_target",
+      "request": {
+        "input_length": 64000,
+        "turn_depth": 2
+      }
+    }
+  ],
+  "source": "src/ssched/scheduler/policy/smetric.py",
+  "source_sha256": "7871badc7d4be2bb83565400f6227b51f40b251e939695cc628c782982d01659",
+  "sources_sha256": {
+    "src/ssched/scheduler/core.py": "662264cb1f60f24a67fc6b78638031881b67dcd3935fbbb3e08c2867f354da89",
+    "src/ssched/scheduler/policy/baselines.py": "31c347d40eacd10dc2c3b8900dde6502b2d8260266422d209d865d75bec9c819",
+    "src/ssched/scheduler/policy/external.py": "e871dce0f4751c3a530fcc28c4c80cfd375ba17be037c3fda52aeb6952a5ba89",
+    "src/ssched/scheduler/policy/service_cost.py": "2b620a4857a901ed072308240c90fdc0ba509dc928e44d94262c9592a69e9a50",
+    "src/ssched/scheduler/policy/smetric.py": "7871badc7d4be2bb83565400f6227b51f40b251e939695cc628c782982d01659",
+    "src/ssched/state/schema.py": "8cf8a3b0b2d086d84533d23e0a8960c748c17903666ab2593ebe4edcd382ef47"
+  }
+}

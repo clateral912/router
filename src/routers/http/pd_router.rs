@@ -320,17 +320,20 @@ impl PdRouterBase {
 
     /// Register a worker and notify the policy registry.
     fn register_and_notify(&self, worker_arc: Arc<dyn Worker>) {
+        let worker_type = worker_arc.worker_type();
         self.worker_registry.register(worker_arc.clone());
         let model_id = worker_arc.model_id();
         let policy = self.policy_registry.on_worker_added(model_id, None);
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
+        if policy.requires_initialization() {
+            policy.init_workers(std::slice::from_ref(&worker_arc));
+        }
+        let role_policy = match worker_type {
+            WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
+            WorkerType::Decode => self.policy_registry.get_decode_policy(),
+            WorkerType::Regular => return,
+        };
+        if role_policy.requires_initialization() {
+            role_policy.init_workers(std::slice::from_ref(&worker_arc));
         }
     }
 
@@ -340,40 +343,9 @@ impl PdRouterBase {
             return self.remove_dp_expanded_workers(url, "prefill");
         }
 
-        // Exact URL match (with @rank or dp_size==1)
-        let model_id = match self.worker_registry.get_by_url(url) {
-            Some(worker) => worker.model_id().to_string(),
-            None => {
-                return Err(PDRouterError::WorkerNotFound {
-                    url: url.to_string(),
-                });
-            }
-        };
-
-        let removed = self.worker_registry.remove_by_url(url);
-
-        if removed.is_some() {
-            self.policy_registry.on_worker_removed(&model_id);
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
-        }
-
-        if removed.is_some() {
-            info!("Removed prefill server: {}", url);
-            Ok(format!("Successfully removed prefill server: {}", url))
-        } else {
-            Err(PDRouterError::WorkerNotFound {
-                url: url.to_string(),
-            })
-        }
+        self.remove_worker_and_notify(url)?;
+        info!("Removed prefill server: {}", url);
+        Ok(format!("Successfully removed prefill server: {}", url))
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -381,42 +353,37 @@ impl PdRouterBase {
             return self.remove_dp_expanded_workers(url, "decode");
         }
 
-        let model_id = match self.worker_registry.get_by_url(url) {
-            Some(worker) => worker.model_id().to_string(),
-            None => {
-                return Err(PDRouterError::WorkerNotFound {
-                    url: url.to_string(),
-                });
-            }
+        self.remove_worker_and_notify(url)?;
+        info!("Removed decode server: {}", url);
+        Ok(format!("Successfully removed decode server: {}", url))
+    }
+
+    fn remove_worker_and_notify(&self, url: &str) -> Result<(), PDRouterError> {
+        let worker = self
+            .worker_registry
+            .remove_by_url(url)
+            .ok_or_else(|| PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            })?;
+        let model_id = worker.model_id().to_string();
+        let model_policy = self.policy_registry.get_policy(&model_id);
+        let role_policy = match worker.worker_type() {
+            WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
+            WorkerType::Decode => self.policy_registry.get_decode_policy(),
+            WorkerType::Regular => self.policy_registry.get_default_policy(),
         };
 
-        let removed = self.worker_registry.remove_by_url(url);
-
-        if removed.is_some() {
-            // Notify PolicyRegistry about the removed worker
-            self.policy_registry.on_worker_removed(&model_id);
-
-            // Get the policy for this model to update cache-aware if needed
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+        if let Some(policy) = model_policy.as_ref() {
+            policy.remove_worker_by_url(url);
         }
-
-        if removed.is_some() {
-            info!("Removed decode server: {}", url);
-            Ok(format!("Successfully removed decode server: {}", url))
-        } else {
-            Err(PDRouterError::WorkerNotFound {
-                url: url.to_string(),
-            })
+        let notify_role_policy = model_policy
+            .as_ref()
+            .map_or(true, |policy| !Arc::ptr_eq(policy, &role_policy));
+        if notify_role_policy {
+            role_policy.remove_worker_by_url(url);
         }
+        self.policy_registry.on_worker_removed(&model_id);
+        Ok(())
     }
 
     /// Remove all DP-expanded workers for a bare URL by prefix match.
@@ -428,19 +395,7 @@ impl PdRouterBase {
         let mut removed_count = 0;
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
-                let model_id = w.model_id().to_string();
-                if self.worker_registry.remove_by_url(w.url()).is_some() {
-                    self.policy_registry.on_worker_removed(&model_id);
-                    if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                        if policy.name() == "cache_aware" {
-                            if let Some(cache_aware) = policy
-                                .as_any()
-                                .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                            ) {
-                                cache_aware.remove_worker_by_url(w.url());
-                            }
-                        }
-                    }
+                if self.remove_worker_and_notify(w.url()).is_ok() {
                     removed_count += 1;
                 }
             }

@@ -9,7 +9,7 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{PolicyRegistry, PolicyRequestLifecycle, RequestHeaders};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -18,12 +18,14 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -640,6 +642,7 @@ impl VllmPDRouter {
         instances: &[(String, String)],
         is_prefill: bool,
         request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -655,8 +658,12 @@ impl VllmPDRouter {
             self.policy_registry.get_decode_policy()
         };
 
+        if policy.requires_initialization() {
+            policy.init_workers(&workers);
+        }
+
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker_with_headers(&workers, request_text, headers)
     }
 
     /// Process vLLM request using pure service discovery
@@ -698,22 +705,41 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let request_headers: Option<RequestHeaders> = headers.map(|values| {
+            values
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+                })
+                .collect()
+        });
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+        let prefill_idx = match self.select_worker_with_policy(
+            &prefill_instances,
+            true,
+            request_str,
+            request_headers.as_ref(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                RouterMetrics::record_pd_error("server_selection");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
+        let decode_idx = match self.select_worker_with_policy(
+            &decode_instances,
+            false,
+            request_str,
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 RouterMetrics::record_pd_error("server_selection");
@@ -782,6 +808,7 @@ impl VllmPDRouter {
         start_time: Instant,
         is_streaming: bool,
         needs_logprobs: bool,
+        lifecycle: Option<Arc<PolicyRequestLifecycle>>,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -810,6 +837,9 @@ impl VllmPDRouter {
                 .bytes()
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
+            if let Some(lifecycle) = lifecycle.as_deref() {
+                lifecycle.first_response();
+            }
 
             let mut decode_json: Value = serde_json::from_slice(&decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
@@ -830,9 +860,13 @@ impl VllmPDRouter {
             for (name, value) in resp_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            return response_builder
+            let response = response_builder
                 .body(axum::body::Body::from(merged_body))
-                .map_err(|e| format!("Failed to build response: {}", e));
+                .map_err(|e| format!("Failed to build response: {}", e))?;
+            if let Some(lifecycle) = lifecycle.as_deref() {
+                lifecycle.complete(status.is_success());
+            }
+            return Ok(response);
         }
 
         debug!(
@@ -850,7 +884,38 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let stream = decode_response.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let mut first = true;
+                let mut success = status.is_success();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if first {
+                                if let Some(lifecycle) = lifecycle.as_deref() {
+                                    lifecycle.first_response();
+                                }
+                                first = false;
+                            }
+                            if tx.send(Ok(bytes)).is_err() {
+                                success = false;
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            success = false;
+                            let _ = tx.send(Err(format!("Decode stream error: {error}")));
+                            break;
+                        }
+                    }
+                }
+                if let Some(lifecycle) = lifecycle.as_deref() {
+                    lifecycle.complete(success);
+                }
+            });
+            let body = axum::body::Body::from_stream(UnboundedReceiverStream::new(rx));
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -865,13 +930,20 @@ impl VllmPDRouter {
             .bytes()
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
+        if let Some(lifecycle) = lifecycle.as_deref() {
+            lifecycle.first_response();
+        }
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
             response_builder = response_builder.header(name, value);
         }
-        response_builder
+        let response = response_builder
             .body(axum::body::Body::from(body))
-            .map_err(|e| format!("Failed to build response: {}", e))
+            .map_err(|e| format!("Failed to build response: {}", e))?;
+        if let Some(lifecycle) = lifecycle.as_deref() {
+            lifecycle.complete(status.is_success());
+        }
+        Ok(response)
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
@@ -888,6 +960,33 @@ impl VllmPDRouter {
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
         let start_time = Instant::now();
+        let request_text = serde_json::to_string(&request_json).ok();
+        let request_headers: Option<RequestHeaders> = headers.map(|values| {
+            values
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+                })
+                .collect()
+        });
+        let policy_url = |url: &str| {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                url.to_string()
+            } else {
+                format!("http://{url}")
+            }
+        };
+        let prefill_policy_url = policy_url(prefill_http);
+        let decode_policy_url = policy_url(decode_http);
+        let prefill_lifecycle = PolicyRequestLifecycle::start(
+            self.policy_registry.get_prefill_policy(),
+            &prefill_policy_url,
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        );
         debug!(
             "Prefill: HTTP={}, ZMQ={}, Decode: HTTP={}, ZMQ={}, Path: {}",
             prefill_http, prefill_zmq, decode_http, decode_zmq, path
@@ -1023,11 +1122,17 @@ impl VllmPDRouter {
                     prefill_http, full_error
                 )
             })?;
+            if let Some(lifecycle) = prefill_lifecycle.as_deref() {
+                lifecycle.first_response();
+            }
 
             debug!("Prefill response body: {}", prefill_response_text);
 
             let prefill_json: Value = serde_json::from_str(&prefill_response_text)
                 .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
+            if let Some(lifecycle) = prefill_lifecycle.as_deref() {
+                lifecycle.complete(true);
+            }
 
             // Stop profiling on prefill server once we have its response.
             self.stop_profiling(&format!("http://{}", prefill_base_http))
@@ -1090,6 +1195,12 @@ impl VllmPDRouter {
         }
 
         let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_lifecycle = PolicyRequestLifecycle::start(
+            self.policy_registry.get_decode_policy(),
+            &decode_policy_url,
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        );
 
         // Concurrent dispatch: run prefill and decode concurrently via tokio::join! so the prefill
         // task is always guaranteed to execute (unlike fire-and-forget tokio::spawn, which
@@ -1104,6 +1215,7 @@ impl VllmPDRouter {
             let enable_profiling = self.enable_profiling;
             let profiling_tasks = &self.profiling_tasks;
             let pd_router = &self.pd_router;
+            let concurrent_prefill_lifecycle = prefill_lifecycle.clone();
             let prefill_fut = async move {
                 let result = otel_http::send_client_request(
                     build_prefill_request_builder(
@@ -1136,10 +1248,20 @@ impl VllmPDRouter {
                         match resp.bytes().await {
                             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                                 Ok(json) => {
+                                    if let Some(lifecycle) = concurrent_prefill_lifecycle.as_deref()
+                                    {
+                                        lifecycle.first_response();
+                                        lifecycle.complete(true);
+                                    }
                                     debug!("Concurrent prefill completed with status {}", status);
                                     Ok(Some(json))
                                 }
                                 Err(_) => {
+                                    if let Some(lifecycle) = concurrent_prefill_lifecycle.as_deref()
+                                    {
+                                        lifecycle.first_response();
+                                        lifecycle.complete(true);
+                                    }
                                     debug!(
                                         "Concurrent prefill completed with status {} (non-JSON body)",
                                         status
@@ -1226,6 +1348,7 @@ impl VllmPDRouter {
                     start_time,
                     is_streaming,
                     needs_logprobs,
+                    decode_lifecycle,
                 )
                 .await;
         }
@@ -1267,6 +1390,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            decode_lifecycle,
         )
         .await
     }
@@ -1286,6 +1410,30 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
+        let request_text = serde_json::to_string(&original_request).ok();
+        let request_headers: Option<RequestHeaders> = headers.map(|values| {
+            values
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+                })
+                .collect()
+        });
+        let prefill_lifecycle = PolicyRequestLifecycle::start(
+            self.policy_registry.get_prefill_policy(),
+            prefill_worker.url(),
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        );
+        let decode_lifecycle = PolicyRequestLifecycle::start(
+            self.policy_registry.get_decode_policy(),
+            decode_worker.url(),
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        );
 
         if let Some((prefill_request, decode_request, request_id)) = self
             .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
@@ -1301,6 +1449,8 @@ impl VllmPDRouter {
                     path,
                     headers,
                     start_time,
+                    prefill_lifecycle,
+                    decode_lifecycle,
                 )
                 .await;
         }
@@ -1420,7 +1570,8 @@ impl VllmPDRouter {
             }
         };
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
+        let prefill_status = prefill_response.status();
+        debug!("📥 Prefill response status: {}", prefill_status);
         debug!(
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
@@ -1428,7 +1579,12 @@ impl VllmPDRouter {
 
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                if let Some(lifecycle) = prefill_lifecycle.as_deref() {
+                    lifecycle.first_response();
+                }
+                bytes
+            }
             Err(e) => {
                 prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
@@ -1470,6 +1626,9 @@ impl VllmPDRouter {
                 });
             }
         };
+        if let Some(lifecycle) = prefill_lifecycle.as_deref() {
+            lifecycle.complete(prefill_status.is_success());
+        }
 
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
@@ -1543,6 +1702,13 @@ impl VllmPDRouter {
         // Add X-data-parallel-rank header using shared utilities
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
+
+        let decode_lifecycle = PolicyRequestLifecycle::start(
+            self.policy_registry.get_decode_policy(),
+            decode_worker.url(),
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        );
 
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.json(&decode_request),
@@ -1620,6 +1786,9 @@ impl VllmPDRouter {
                             decode_url, e
                         ),
                     })?;
+            if let Some(lifecycle) = decode_lifecycle.as_deref() {
+                lifecycle.first_response();
+            }
 
             // Parse decode response as JSON
             let mut decode_json: Value =
@@ -1649,11 +1818,15 @@ impl VllmPDRouter {
                 }
             }
 
-            response_builder.body(Body::from(merged_body)).map_err(|e| {
-                PDRouterError::NetworkError {
+            let response = response_builder
+                .body(Body::from(merged_body))
+                .map_err(|e| PDRouterError::NetworkError {
                     message: format!("Failed to build response from {}: {}", decode_url, e),
-                }
-            })
+                })?;
+            if let Some(lifecycle) = decode_lifecycle.as_deref() {
+                lifecycle.complete(status.is_success());
+            }
+            Ok(response)
         } else {
             // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
             debug!(
@@ -1668,7 +1841,38 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let stream = decode_response.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let mut first = true;
+                let mut success = status.is_success();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if first {
+                                if let Some(lifecycle) = decode_lifecycle.as_deref() {
+                                    lifecycle.first_response();
+                                }
+                                first = false;
+                            }
+                            if tx.send(Ok(bytes)).is_err() {
+                                success = false;
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            success = false;
+                            let _ = tx.send(Err(format!("Decode stream error: {error}")));
+                            break;
+                        }
+                    }
+                }
+                if let Some(lifecycle) = decode_lifecycle.as_deref() {
+                    lifecycle.complete(success);
+                }
+            });
+            let body = Body::from_stream(UnboundedReceiverStream::new(rx));
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -1721,6 +1925,8 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         start_time: Instant,
+        prefill_lifecycle: Option<Arc<PolicyRequestLifecycle>>,
+        decode_lifecycle: Option<Arc<PolicyRequestLifecycle>>,
     ) -> Result<Response, PDRouterError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
@@ -1776,11 +1982,16 @@ impl VllmPDRouter {
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
-            Ok(resp) if resp.status().is_success() => resp
-                .bytes()
-                .await
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
+            Ok(resp) if resp.status().is_success() => {
+                let body = resp.bytes().await.ok();
+                if body.is_some() {
+                    if let Some(lifecycle) = prefill_lifecycle.as_deref() {
+                        lifecycle.first_response();
+                        lifecycle.complete(true);
+                    }
+                }
+                body.and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            }
             Ok(resp) => {
                 decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
@@ -1860,6 +2071,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            decode_lifecycle,
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
