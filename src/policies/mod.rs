@@ -40,6 +40,13 @@ pub use smetric::{
 pub type RequestHeaders = HashMap<String, String>;
 
 /// Owns one policy reservation until an HTTP response finishes or is dropped.
+///
+/// SMetric uses this lifecycle to estimate in-flight prefill work, active decode context,
+/// and first-response timing for overload and budget scoring. The current adapter uses
+/// request-text character count as a token proxy; first response is a router observation,
+/// not exact engine TTFT or KV state. Existing worker load is only a request count, while
+/// CacheAware's placement-history Tree is insufficient for these per-request estimates.
+/// Completion and `Drop` release the reservation, including cancellation cleanup.
 #[derive(Debug)]
 pub(crate) struct PolicyRequestLifecycle {
     policy: Arc<dyn LoadBalancingPolicy>,
@@ -50,6 +57,7 @@ pub(crate) struct PolicyRequestLifecycle {
 }
 
 impl PolicyRequestLifecycle {
+    /// Start an optional policy reservation for this request.
     pub(crate) fn start(
         policy: Arc<dyn LoadBalancingPolicy>,
         worker_url: &str,
@@ -70,6 +78,7 @@ impl PolicyRequestLifecycle {
             })
     }
 
+    /// Record the router's first-response observation for timing calibration.
     pub(crate) fn first_response(&self) {
         self.policy.on_request_first_response(
             &self.worker_url,
@@ -78,6 +87,7 @@ impl PolicyRequestLifecycle {
         );
     }
 
+    /// Finish the reservation once, including unsuccessful requests.
     pub(crate) fn complete(&self, success: bool) {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
@@ -162,6 +172,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Optionally start policy-specific request accounting; other policies may use the default.
     fn on_request_start(
         &self,
         _worker_url: &str,
@@ -171,6 +182,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         None
     }
 
+    /// Optionally observe the router's first response for request timing.
     fn on_request_first_response(
         &self,
         _worker_url: &str,
@@ -179,6 +191,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ) {
     }
 
+    /// Optionally finish request accounting and release policy-specific state.
     fn on_request_finish(
         &self,
         worker_url: &str,
@@ -189,6 +202,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         self.on_request_complete(worker_url, success);
     }
 
+    /// Whether periodic worker-load updates should be tracked for this policy.
     fn tracks_worker_load(&self) -> bool {
         self.name() == "cache_aware"
     }
@@ -236,6 +250,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't need initialization
     }
 
+    /// Remove worker-specific state; CacheAware cleanup is retained for that policy.
     fn remove_worker_by_url(&self, url: &str) {
         if let Some(cache_aware) = self.as_any().downcast_ref::<CacheAwarePolicy>() {
             cache_aware.remove_worker_by_url(url);
