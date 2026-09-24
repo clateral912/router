@@ -343,39 +343,9 @@ impl PdRouterBase {
             return self.remove_dp_expanded_workers(url, "prefill");
         }
 
-        // Exact URL match (with @rank or dp_size==1)
-        let (model_id, worker_type) = match self.worker_registry.get_by_url(url) {
-            Some(worker) => (worker.model_id().to_string(), worker.worker_type()),
-            None => {
-                return Err(PDRouterError::WorkerNotFound {
-                    url: url.to_string(),
-                });
-            }
-        };
-
-        let removed = self.worker_registry.remove_by_url(url);
-
-        if removed.is_some() {
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                policy.remove_worker_by_url(url);
-            }
-            self.policy_registry.on_worker_removed(&model_id);
-            let role_policy = match worker_type {
-                WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
-                WorkerType::Decode => self.policy_registry.get_decode_policy(),
-                WorkerType::Regular => self.policy_registry.get_default_policy(),
-            };
-            role_policy.remove_worker_by_url(url);
-        }
-
-        if removed.is_some() {
-            info!("Removed prefill server: {}", url);
-            Ok(format!("Successfully removed prefill server: {}", url))
-        } else {
-            Err(PDRouterError::WorkerNotFound {
-                url: url.to_string(),
-            })
-        }
+        self.remove_worker_and_notify(url)?;
+        info!("Removed prefill server: {}", url);
+        Ok(format!("Successfully removed prefill server: {}", url))
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -383,38 +353,37 @@ impl PdRouterBase {
             return self.remove_dp_expanded_workers(url, "decode");
         }
 
-        let (model_id, worker_type) = match self.worker_registry.get_by_url(url) {
-            Some(worker) => (worker.model_id().to_string(), worker.worker_type()),
-            None => {
-                return Err(PDRouterError::WorkerNotFound {
-                    url: url.to_string(),
-                });
-            }
+        self.remove_worker_and_notify(url)?;
+        info!("Removed decode server: {}", url);
+        Ok(format!("Successfully removed decode server: {}", url))
+    }
+
+    fn remove_worker_and_notify(&self, url: &str) -> Result<(), PDRouterError> {
+        let worker = self
+            .worker_registry
+            .remove_by_url(url)
+            .ok_or_else(|| PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            })?;
+        let model_id = worker.model_id().to_string();
+        let model_policy = self.policy_registry.get_policy(&model_id);
+        let role_policy = match worker.worker_type() {
+            WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
+            WorkerType::Decode => self.policy_registry.get_decode_policy(),
+            WorkerType::Regular => self.policy_registry.get_default_policy(),
         };
 
-        let removed = self.worker_registry.remove_by_url(url);
-
-        if removed.is_some() {
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                policy.remove_worker_by_url(url);
-            }
-            self.policy_registry.on_worker_removed(&model_id);
-            let role_policy = match worker_type {
-                WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
-                WorkerType::Decode => self.policy_registry.get_decode_policy(),
-                WorkerType::Regular => self.policy_registry.get_default_policy(),
-            };
+        if let Some(policy) = model_policy.as_ref() {
+            policy.remove_worker_by_url(url);
+        }
+        let notify_role_policy = model_policy
+            .as_ref()
+            .map_or(true, |policy| !Arc::ptr_eq(policy, &role_policy));
+        if notify_role_policy {
             role_policy.remove_worker_by_url(url);
         }
-
-        if removed.is_some() {
-            info!("Removed decode server: {}", url);
-            Ok(format!("Successfully removed decode server: {}", url))
-        } else {
-            Err(PDRouterError::WorkerNotFound {
-                url: url.to_string(),
-            })
-        }
+        self.policy_registry.on_worker_removed(&model_id);
+        Ok(())
     }
 
     /// Remove all DP-expanded workers for a bare URL by prefix match.
@@ -426,19 +395,7 @@ impl PdRouterBase {
         let mut removed_count = 0;
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
-                let model_id = w.model_id().to_string();
-                let worker_type = w.worker_type();
-                if self.worker_registry.remove_by_url(w.url()).is_some() {
-                    if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                        policy.remove_worker_by_url(w.url());
-                    }
-                    self.policy_registry.on_worker_removed(&model_id);
-                    let role_policy = match worker_type {
-                        WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
-                        WorkerType::Decode => self.policy_registry.get_decode_policy(),
-                        WorkerType::Regular => self.policy_registry.get_default_policy(),
-                    };
-                    role_policy.remove_worker_by_url(w.url());
+                if self.remove_worker_and_notify(w.url()).is_ok() {
                     removed_count += 1;
                 }
             }
