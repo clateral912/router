@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, TraceConfig,
+    RouterConfig, RoutingMode, SMetricDrainSource, SMetricFallback, SMetricGate,
+    SMetricPolicyConfig, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -114,7 +115,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     policy: String,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
@@ -131,11 +132,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -165,6 +166,70 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// SMetric gate. Defaults reproduce the Fig. 13 prototype.
+    #[arg(long, value_enum, default_value_t = SMetricGate::Overload)]
+    smetric_gate: SMetricGate,
+    #[arg(long, default_value_t = 2.0)]
+    smetric_overload_factor: f64,
+    #[arg(long, default_value_t = 0.5)]
+    smetric_hit_ratio: f64,
+    #[arg(long, default_value_t = 1.0)]
+    smetric_budget_gamma: f64,
+    #[arg(long, default_value_t = 2300.0)]
+    smetric_drain_tps: f64,
+    #[arg(long, value_enum, default_value_t = SMetricDrainSource::Config)]
+    smetric_drain_source: SMetricDrainSource,
+    #[arg(long, default_value_t = false)]
+    smetric_store_pricing: bool,
+    #[arg(long, default_value_t = false)]
+    smetric_queue_store_pricing: bool,
+    #[arg(long, default_value_t = false)]
+    smetric_service_time_routing: bool,
+    #[arg(long, default_value_t = 0.28)]
+    smetric_service_fixed_s: f64,
+    #[arg(long)]
+    smetric_home_quiet_stick: Option<usize>,
+    #[arg(long)]
+    smetric_session_home_depth: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    smetric_store_rescue: bool,
+    #[arg(long, default_value_t = 162000.0)]
+    smetric_store_load_tps: f64,
+    #[arg(long, default_value_t = false)]
+    smetric_contract_safe: bool,
+    #[arg(long, default_value_t = 1.0)]
+    smetric_slo_base_s: f64,
+    #[arg(long, default_value_t = 8000.0)]
+    smetric_slo_input_tokens_per_s: f64,
+    #[arg(long, default_value_t = 0.030)]
+    smetric_slo_tpot_s: f64,
+    #[arg(long, default_value_t = 1.0)]
+    smetric_budget_base_s: f64,
+    #[arg(long, default_value_t = 16000.0)]
+    smetric_budget_input_tokens_per_s: f64,
+    #[arg(long, value_enum, default_value_t = SMetricFallback::Dynamo)]
+    smetric_fallback: SMetricFallback,
+    #[arg(long, default_value_t = 6923.0)]
+    smetric_attention_l_eq: f64,
+    #[arg(long, default_value_t = 16)]
+    smetric_block_size: usize,
+    #[arg(long, default_value_t = 1.0)]
+    smetric_prefill_load_scale: f64,
+    #[arg(long, default_value_t = 0.0)]
+    smetric_decode_active_request_weight: f64,
+    #[arg(long, default_value_t = 1.0)]
+    smetric_overlap_score_credit: f64,
+    #[arg(long, default_value_t = 0.0)]
+    smetric_overlap_score_credit_decay: f64,
+    #[arg(long, default_value_t = 0.0)]
+    smetric_host_cache_hit_weight: f64,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    smetric_track_prefill_tokens: bool,
+    #[arg(long, default_value_t = 180)]
+    smetric_drain_window_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    smetric_drain_min_samples: usize,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -380,6 +445,41 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
+            "smetric" => PolicyConfig::SMetric(Box::new(SMetricPolicyConfig {
+                overload_factor: self.smetric_overload_factor,
+                hit_ratio: self.smetric_hit_ratio,
+                gate: self.smetric_gate,
+                budget_gamma: self.smetric_budget_gamma,
+                drain_tps: self.smetric_drain_tps,
+                drain_source: self.smetric_drain_source,
+                store_pricing: self.smetric_store_pricing,
+                queue_store_pricing: self.smetric_queue_store_pricing,
+                service_time_routing: self.smetric_service_time_routing,
+                service_fixed_s: self.smetric_service_fixed_s,
+                home_quiet_stick: self.smetric_home_quiet_stick,
+                session_home_depth: self.smetric_session_home_depth,
+                store_rescue: self.smetric_store_rescue,
+                store_load_tps: self.smetric_store_load_tps,
+                contract_safe: self.smetric_contract_safe,
+                slo_base_s: self.smetric_slo_base_s,
+                slo_input_tokens_per_s: self.smetric_slo_input_tokens_per_s,
+                slo_tpot_s: self.smetric_slo_tpot_s,
+                budget_base_s: self.smetric_budget_base_s,
+                budget_input_tokens_per_s: self.smetric_budget_input_tokens_per_s,
+                fallback: self.smetric_fallback,
+                attention_l_eq: self.smetric_attention_l_eq,
+                block_size: self.smetric_block_size,
+                prefill_load_scale: self.smetric_prefill_load_scale,
+                decode_active_request_weight: self.smetric_decode_active_request_weight,
+                overlap_score_credit: self.smetric_overlap_score_credit,
+                overlap_score_credit_decay: self.smetric_overlap_score_credit_decay,
+                host_cache_hit_weight: self.smetric_host_cache_hit_weight,
+                track_prefill_tokens: self.smetric_track_prefill_tokens,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+                drain_window_secs: self.smetric_drain_window_secs,
+                drain_min_samples: self.smetric_drain_min_samples,
+            })),
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }

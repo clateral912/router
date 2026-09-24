@@ -246,6 +246,129 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+
+    /// SMetric's complete Fig. 13 policy and experimental arms.
+    #[serde(rename = "smetric")]
+    SMetric(Box<SMetricPolicyConfig>),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SMetricGate {
+    #[default]
+    Overload,
+    Budget,
+    #[value(alias = "budget_attention")]
+    BudgetAttention,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SMetricFallback {
+    #[default]
+    Load,
+    Dynamo,
+    /// Historical spelling retained by the Python implementation.
+    #[value(alias = "dynamo_logit")]
+    DynamoLogit,
+    Lmetric,
+    #[value(alias = "prefill_work_attention")]
+    PrefillWorkAttention,
+    #[value(alias = "lmetric_attention")]
+    LmetricAttention,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SMetricDrainSource {
+    #[default]
+    Config,
+    Measured,
+}
+
+/// Complete configuration surface of ssched's SMetric implementation.
+///
+/// These defaults are the Python Fig. 13 prototype. Deployment presets are
+/// intentionally separate so selecting `smetric` never silently selects one
+/// of the 30B/235B production arms.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SMetricPolicyConfig {
+    pub overload_factor: f64,
+    pub hit_ratio: f64,
+    pub gate: SMetricGate,
+    pub budget_gamma: f64,
+    pub drain_tps: f64,
+    pub drain_source: SMetricDrainSource,
+    pub store_pricing: bool,
+    pub queue_store_pricing: bool,
+    pub service_time_routing: bool,
+    pub service_fixed_s: f64,
+    pub home_quiet_stick: Option<usize>,
+    pub session_home_depth: Option<usize>,
+    pub store_rescue: bool,
+    pub store_load_tps: f64,
+    pub contract_safe: bool,
+    pub slo_base_s: f64,
+    pub slo_input_tokens_per_s: f64,
+    pub slo_tpot_s: f64,
+    pub budget_base_s: f64,
+    pub budget_input_tokens_per_s: f64,
+    pub fallback: SMetricFallback,
+    pub attention_l_eq: f64,
+    pub block_size: usize,
+    pub prefill_load_scale: f64,
+    pub decode_active_request_weight: f64,
+    pub overlap_score_credit: f64,
+    pub overlap_score_credit_decay: f64,
+    pub host_cache_hit_weight: f64,
+    pub track_prefill_tokens: bool,
+    /// Router Tree maintenance, separate from the algorithm's 16-token block.
+    pub eviction_interval_secs: u64,
+    pub max_tree_size: usize,
+    /// Sliding window used for router-observed online rate calibration.
+    pub drain_window_secs: u64,
+    pub drain_min_samples: usize,
+}
+
+impl Default for SMetricPolicyConfig {
+    fn default() -> Self {
+        Self {
+            overload_factor: 2.0,
+            hit_ratio: 0.5,
+            gate: SMetricGate::Overload,
+            budget_gamma: 1.0,
+            drain_tps: 2300.0,
+            drain_source: SMetricDrainSource::Config,
+            store_pricing: false,
+            queue_store_pricing: false,
+            service_time_routing: false,
+            service_fixed_s: 0.28,
+            home_quiet_stick: None,
+            session_home_depth: None,
+            store_rescue: false,
+            store_load_tps: 162_000.0,
+            contract_safe: false,
+            slo_base_s: 1.0,
+            slo_input_tokens_per_s: 8_000.0,
+            slo_tpot_s: 0.030,
+            budget_base_s: 1.0,
+            budget_input_tokens_per_s: 16_000.0,
+            fallback: SMetricFallback::Dynamo,
+            attention_l_eq: 6923.0,
+            block_size: 16,
+            prefill_load_scale: 1.0,
+            decode_active_request_weight: 0.0,
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            host_cache_hit_weight: 0.0,
+            track_prefill_tokens: true,
+            eviction_interval_secs: 120,
+            max_tree_size: 67_108_864,
+            drain_window_secs: 180,
+            drain_min_samples: 5,
+        }
+    }
 }
 
 impl PolicyConfig {
@@ -257,6 +380,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::SMetric(_) => "smetric",
         }
     }
 }
@@ -714,6 +838,42 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        let smetric = PolicyConfig::SMetric(Box::default());
+        assert_eq!(smetric.name(), "smetric");
+    }
+
+    #[test]
+    fn test_smetric_defaults_and_serialization() {
+        let defaults = SMetricPolicyConfig::default();
+        assert_eq!(defaults.gate, SMetricGate::Overload);
+        assert_eq!(defaults.fallback, SMetricFallback::Dynamo);
+        assert_eq!(defaults.drain_source, SMetricDrainSource::Config);
+        assert_eq!(defaults.overload_factor, 2.0);
+        assert_eq!(defaults.drain_tps, 2300.0);
+        assert_eq!(defaults.attention_l_eq, 6923.0);
+        assert!(!defaults.contract_safe);
+        assert!(!defaults.store_rescue);
+
+        let policy = PolicyConfig::SMetric(Box::new(SMetricPolicyConfig {
+            gate: SMetricGate::BudgetAttention,
+            fallback: SMetricFallback::LmetricAttention,
+            contract_safe: true,
+            ..defaults
+        }));
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains("\"type\":\"smetric\""));
+        assert!(json.contains("\"gate\":\"budget_attention\""));
+        assert!(json.contains("\"fallback\":\"lmetric_attention\""));
+        let decoded = serde_json::from_str::<PolicyConfig>(&json).unwrap();
+        match decoded {
+            PolicyConfig::SMetric(config) => {
+                assert_eq!(config.gate, SMetricGate::BudgetAttention);
+                assert_eq!(config.fallback, SMetricFallback::LmetricAttention);
+                assert!(config.contract_safe);
+            }
+            other => panic!("expected smetric, got {}", other.name()),
+        }
     }
 
     #[test]

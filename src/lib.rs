@@ -26,6 +26,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    SMetric,
 }
 
 #[pyclass]
@@ -42,6 +43,37 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    smetric_gate: String,
+    smetric_overload_factor: f64,
+    smetric_hit_ratio: f64,
+    smetric_budget_gamma: f64,
+    smetric_drain_tps: f64,
+    smetric_drain_source: String,
+    smetric_store_pricing: bool,
+    smetric_queue_store_pricing: bool,
+    smetric_service_time_routing: bool,
+    smetric_service_fixed_s: f64,
+    smetric_home_quiet_stick: Option<usize>,
+    smetric_session_home_depth: Option<usize>,
+    smetric_store_rescue: bool,
+    smetric_store_load_tps: f64,
+    smetric_contract_safe: bool,
+    smetric_slo_base_s: f64,
+    smetric_slo_input_tokens_per_s: f64,
+    smetric_slo_tpot_s: f64,
+    smetric_budget_base_s: f64,
+    smetric_budget_input_tokens_per_s: f64,
+    smetric_fallback: String,
+    smetric_attention_l_eq: f64,
+    smetric_block_size: usize,
+    smetric_prefill_load_scale: f64,
+    smetric_decode_active_request_weight: f64,
+    smetric_overlap_score_credit: f64,
+    smetric_overlap_score_credit_decay: f64,
+    smetric_host_cache_hit_weight: f64,
+    smetric_track_prefill_tokens: bool,
+    smetric_drain_window_secs: u64,
+    smetric_drain_min_samples: usize,
     max_payload_size: usize,
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
@@ -104,11 +136,17 @@ impl Router {
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            SMetricDrainSource, SMetricFallback, SMetricGate, SMetricPolicyConfig,
         };
 
         // Convert policy helper function
-        let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
-            match policy {
+        let invalid_smetric = |field: &str, value: &str| config::ConfigError::InvalidValue {
+            field: format!("smetric.{field}"),
+            value: value.to_string(),
+            reason: "unknown option".to_string(),
+        };
+        let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
+            Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
@@ -124,7 +162,59 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
-            }
+                PolicyType::SMetric => ConfigPolicyConfig::SMetric(Box::new(SMetricPolicyConfig {
+                    overload_factor: self.smetric_overload_factor,
+                    hit_ratio: self.smetric_hit_ratio,
+                    gate: match self.smetric_gate.as_str() {
+                        "overload" => SMetricGate::Overload,
+                        "budget" => SMetricGate::Budget,
+                        "budget_attention" => SMetricGate::BudgetAttention,
+                        value => return Err(invalid_smetric("gate", value)),
+                    },
+                    budget_gamma: self.smetric_budget_gamma,
+                    drain_tps: self.smetric_drain_tps,
+                    drain_source: match self.smetric_drain_source.as_str() {
+                        "config" => SMetricDrainSource::Config,
+                        "measured" => SMetricDrainSource::Measured,
+                        value => return Err(invalid_smetric("drain_source", value)),
+                    },
+                    store_pricing: self.smetric_store_pricing,
+                    queue_store_pricing: self.smetric_queue_store_pricing,
+                    service_time_routing: self.smetric_service_time_routing,
+                    service_fixed_s: self.smetric_service_fixed_s,
+                    home_quiet_stick: self.smetric_home_quiet_stick,
+                    session_home_depth: self.smetric_session_home_depth,
+                    store_rescue: self.smetric_store_rescue,
+                    store_load_tps: self.smetric_store_load_tps,
+                    contract_safe: self.smetric_contract_safe,
+                    slo_base_s: self.smetric_slo_base_s,
+                    slo_input_tokens_per_s: self.smetric_slo_input_tokens_per_s,
+                    slo_tpot_s: self.smetric_slo_tpot_s,
+                    budget_base_s: self.smetric_budget_base_s,
+                    budget_input_tokens_per_s: self.smetric_budget_input_tokens_per_s,
+                    fallback: match self.smetric_fallback.as_str() {
+                        "load" => SMetricFallback::Load,
+                        "dynamo" => SMetricFallback::Dynamo,
+                        "dynamo_logit" => SMetricFallback::DynamoLogit,
+                        "lmetric" => SMetricFallback::Lmetric,
+                        "prefill_work_attention" => SMetricFallback::PrefillWorkAttention,
+                        "lmetric_attention" => SMetricFallback::LmetricAttention,
+                        value => return Err(invalid_smetric("fallback", value)),
+                    },
+                    attention_l_eq: self.smetric_attention_l_eq,
+                    block_size: self.smetric_block_size,
+                    prefill_load_scale: self.smetric_prefill_load_scale,
+                    decode_active_request_weight: self.smetric_decode_active_request_weight,
+                    overlap_score_credit: self.smetric_overlap_score_credit,
+                    overlap_score_credit_decay: self.smetric_overlap_score_credit_decay,
+                    host_cache_hit_weight: self.smetric_host_cache_hit_weight,
+                    track_prefill_tokens: self.smetric_track_prefill_tokens,
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_tree_size: self.max_tree_size,
+                    drain_window_secs: self.smetric_drain_window_secs,
+                    drain_min_samples: self.smetric_drain_min_samples,
+                })),
+            })
         };
 
         // Determine routing mode
@@ -137,8 +227,16 @@ impl Router {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(&convert_policy)
+                    .transpose()?,
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(&convert_policy)
+                    .transpose()?,
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -148,7 +246,7 @@ impl Router {
         };
 
         // Convert main policy
-        let policy = convert_policy(&self.policy);
+        let policy = convert_policy(&self.policy)?;
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -256,6 +354,37 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        smetric_gate = String::from("overload"),
+        smetric_overload_factor = 2.0,
+        smetric_hit_ratio = 0.5,
+        smetric_budget_gamma = 1.0,
+        smetric_drain_tps = 2300.0,
+        smetric_drain_source = String::from("config"),
+        smetric_store_pricing = false,
+        smetric_queue_store_pricing = false,
+        smetric_service_time_routing = false,
+        smetric_service_fixed_s = 0.28,
+        smetric_home_quiet_stick = None,
+        smetric_session_home_depth = None,
+        smetric_store_rescue = false,
+        smetric_store_load_tps = 162000.0,
+        smetric_contract_safe = false,
+        smetric_slo_base_s = 1.0,
+        smetric_slo_input_tokens_per_s = 8000.0,
+        smetric_slo_tpot_s = 0.030,
+        smetric_budget_base_s = 1.0,
+        smetric_budget_input_tokens_per_s = 16000.0,
+        smetric_fallback = String::from("dynamo"),
+        smetric_attention_l_eq = 6923.0,
+        smetric_block_size = 16,
+        smetric_prefill_load_scale = 1.0,
+        smetric_decode_active_request_weight = 0.0,
+        smetric_overlap_score_credit = 1.0,
+        smetric_overlap_score_credit_decay = 0.0,
+        smetric_host_cache_hit_weight = 0.0,
+        smetric_track_prefill_tokens = true,
+        smetric_drain_window_secs = 180,
+        smetric_drain_min_samples = 5,
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,
@@ -324,6 +453,37 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        smetric_gate: String,
+        smetric_overload_factor: f64,
+        smetric_hit_ratio: f64,
+        smetric_budget_gamma: f64,
+        smetric_drain_tps: f64,
+        smetric_drain_source: String,
+        smetric_store_pricing: bool,
+        smetric_queue_store_pricing: bool,
+        smetric_service_time_routing: bool,
+        smetric_service_fixed_s: f64,
+        smetric_home_quiet_stick: Option<usize>,
+        smetric_session_home_depth: Option<usize>,
+        smetric_store_rescue: bool,
+        smetric_store_load_tps: f64,
+        smetric_contract_safe: bool,
+        smetric_slo_base_s: f64,
+        smetric_slo_input_tokens_per_s: f64,
+        smetric_slo_tpot_s: f64,
+        smetric_budget_base_s: f64,
+        smetric_budget_input_tokens_per_s: f64,
+        smetric_fallback: String,
+        smetric_attention_l_eq: f64,
+        smetric_block_size: usize,
+        smetric_prefill_load_scale: f64,
+        smetric_decode_active_request_weight: f64,
+        smetric_overlap_score_credit: f64,
+        smetric_overlap_score_credit_decay: f64,
+        smetric_host_cache_hit_weight: f64,
+        smetric_track_prefill_tokens: bool,
+        smetric_drain_window_secs: u64,
+        smetric_drain_min_samples: usize,
         max_payload_size: usize,
         intra_node_data_parallel_size: usize,
         api_key: Option<String>,
@@ -385,6 +545,37 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            smetric_gate,
+            smetric_overload_factor,
+            smetric_hit_ratio,
+            smetric_budget_gamma,
+            smetric_drain_tps,
+            smetric_drain_source,
+            smetric_store_pricing,
+            smetric_queue_store_pricing,
+            smetric_service_time_routing,
+            smetric_service_fixed_s,
+            smetric_home_quiet_stick,
+            smetric_session_home_depth,
+            smetric_store_rescue,
+            smetric_store_load_tps,
+            smetric_contract_safe,
+            smetric_slo_base_s,
+            smetric_slo_input_tokens_per_s,
+            smetric_slo_tpot_s,
+            smetric_budget_base_s,
+            smetric_budget_input_tokens_per_s,
+            smetric_fallback,
+            smetric_attention_l_eq,
+            smetric_block_size,
+            smetric_prefill_load_scale,
+            smetric_decode_active_request_weight,
+            smetric_overlap_score_credit,
+            smetric_overlap_score_credit_decay,
+            smetric_host_cache_hit_weight,
+            smetric_track_prefill_tokens,
+            smetric_drain_window_secs,
+            smetric_drain_min_samples,
             max_payload_size,
             intra_node_data_parallel_size,
             api_key,

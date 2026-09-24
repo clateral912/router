@@ -191,6 +191,95 @@ impl ConfigValidator {
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }
+            PolicyConfig::SMetric(config) => {
+                if config.overload_factor.is_nan() || config.overload_factor < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "smetric.overload_factor".to_string(),
+                        value: config.overload_factor.to_string(),
+                        reason: "Must be non-negative and not NaN".to_string(),
+                    });
+                }
+                if config.budget_gamma.is_nan() || config.budget_gamma < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "smetric.budget_gamma".to_string(),
+                        value: config.budget_gamma.to_string(),
+                        reason: "Must be non-negative and not NaN".to_string(),
+                    });
+                }
+                for (field, value) in [
+                    ("hit_ratio", config.hit_ratio),
+                    ("budget_base_s", config.budget_base_s),
+                    ("slo_base_s", config.slo_base_s),
+                    ("slo_tpot_s", config.slo_tpot_s),
+                    ("prefill_load_scale", config.prefill_load_scale),
+                    (
+                        "decode_active_request_weight",
+                        config.decode_active_request_weight,
+                    ),
+                ] {
+                    if value < 0.0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("smetric.{field}"),
+                            value: value.to_string(),
+                            reason: "Must be non-negative".to_string(),
+                        });
+                    }
+                }
+                for (field, value) in [
+                    ("drain_tps", config.drain_tps),
+                    ("store_load_tps", config.store_load_tps),
+                    (
+                        "budget_input_tokens_per_s",
+                        config.budget_input_tokens_per_s,
+                    ),
+                    ("slo_input_tokens_per_s", config.slo_input_tokens_per_s),
+                    ("attention_l_eq", config.attention_l_eq),
+                ] {
+                    if value <= 0.0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("smetric.{field}"),
+                            value: value.to_string(),
+                            reason: "Must be positive".to_string(),
+                        });
+                    }
+                }
+                if config.block_size == 0
+                    || config.max_tree_size == 0
+                    || config.drain_window_secs == 0
+                    || config.drain_min_samples == 0
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "SMetric block_size, max_tree_size, drain_window_secs, and drain_min_samples must be positive".to_string(),
+                    });
+                }
+                if matches!(
+                    config.fallback,
+                    SMetricFallback::Dynamo | SMetricFallback::DynamoLogit
+                ) {
+                    for (field, value) in [
+                        ("overlap_score_credit", config.overlap_score_credit),
+                        (
+                            "overlap_score_credit_decay",
+                            config.overlap_score_credit_decay,
+                        ),
+                        ("host_cache_hit_weight", config.host_cache_hit_weight),
+                    ] {
+                        if value < 0.0 {
+                            return Err(ConfigError::InvalidValue {
+                                field: format!("smetric.{field}"),
+                                value: value.to_string(),
+                                reason: "Must be non-negative".to_string(),
+                            });
+                        }
+                    }
+                    if config.store_rescue {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: "SMetric store_rescue is not supported with Dynamo fallback"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -785,5 +874,30 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_smetric_incompatible_and_positive_options() {
+        let mode = RoutingMode::Regular {
+            worker_urls: vec!["http://worker:8000".to_string()],
+        };
+        let invalid_pair = RouterConfig::new(
+            mode.clone(),
+            PolicyConfig::SMetric(Box::new(SMetricPolicyConfig {
+                fallback: SMetricFallback::Dynamo,
+                store_rescue: true,
+                ..Default::default()
+            })),
+        );
+        assert!(ConfigValidator::validate(&invalid_pair).is_err());
+
+        let invalid_rate = RouterConfig::new(
+            mode,
+            PolicyConfig::SMetric(Box::new(SMetricPolicyConfig {
+                drain_tps: 0.0,
+                ..Default::default()
+            })),
+        );
+        assert!(ConfigValidator::validate(&invalid_rate).is_err());
     }
 }

@@ -377,6 +377,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
+    fn tracks_worker_load(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -453,6 +457,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 tree.insert("", worker.url());
             }
         }
+    }
+
+    fn remove_worker_by_url(&self, url: &str) {
+        CacheAwarePolicy::remove_worker_by_url(self, url);
     }
 }
 

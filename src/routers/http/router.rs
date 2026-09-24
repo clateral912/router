@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, PolicyRequestLifecycle};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -128,16 +128,9 @@ impl Router {
             let model_id = worker_arc.model_id();
             let policy = ctx.policy_registry.on_worker_added(model_id, None);
 
-            // If this is a cache-aware policy and it's the first worker for this model,
-            // initialize it with the worker
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    let worker_dyn: Arc<dyn Worker> = worker_arc.clone();
-                    cache_aware.init_workers(std::slice::from_ref(&worker_dyn));
-                }
+            if policy.requires_initialization() {
+                let worker_dyn: Arc<dyn Worker> = worker_arc.clone();
+                policy.init_workers(std::slice::from_ref(&worker_dyn));
             }
         }
 
@@ -571,26 +564,25 @@ impl Router {
                     }
                 };
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
                 let policy = match model_id {
                     Some(model) => self.policy_registry.get_policy_or_default(model),
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
+                let request_headers = Self::headers_to_request_headers(headers);
+                let lifecycle = PolicyRequestLifecycle::start(
+                    Arc::clone(&policy),
+                    worker.url(),
+                    Some(&text),
+                    request_headers.as_ref(),
+                );
+
+                let load_incremented = if policy.tracks_worker_load() {
                     worker.increment_load();
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
                     true
                 } else {
                     false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
                 };
 
                 let response = self
@@ -601,6 +593,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        lifecycle,
                     )
                     .await;
 
@@ -608,18 +601,6 @@ impl Router {
                 // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
 
                 response
             },
@@ -770,7 +751,26 @@ impl Router {
             .await
     }
 
+    fn finish_tracked_request(
+        &self,
+        worker_url: &str,
+        load_incremented: bool,
+        lifecycle: Option<&PolicyRequestLifecycle>,
+        success: bool,
+    ) {
+        if load_incremented {
+            if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                worker.decrement_load();
+                RouterMetrics::set_running_requests(worker_url, worker.load());
+            }
+        }
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.complete(success);
+        }
+    }
+
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -779,6 +779,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        lifecycle: Option<Arc<PolicyRequestLifecycle>>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -786,6 +787,12 @@ impl Router {
                     Ok(tup) => tup,
                     Err(e) => {
                         error!("Failed to extract dp_rank: {}", e);
+                        self.finish_tracked_request(
+                            worker_url,
+                            load_incremented,
+                            lifecycle.as_deref(),
+                            false,
+                        );
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to extract dp_rank: {}", e),
@@ -798,6 +805,12 @@ impl Router {
                 let json_val = match serde_json::to_value(typed_req) {
                     Ok(j) => j,
                     Err(e) => {
+                        self.finish_tracked_request(
+                            worker_url,
+                            load_incremented,
+                            lifecycle.as_deref(),
+                            false,
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             format!("Convert into serde_json::Value failed: {}", e),
@@ -863,13 +876,12 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
+                self.finish_tracked_request(
+                    worker_url,
+                    load_incremented,
+                    lifecycle.as_deref(),
+                    false,
+                );
 
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -883,127 +895,76 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
-
-            let response = match res.bytes().await {
+            let (response, body_ok) = match res.bytes().await {
                 Ok(body) => {
+                    if let Some(lifecycle) = lifecycle.as_deref() {
+                        lifecycle.first_response();
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
-                    response
+                    (response, true)
                 }
-                Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
-                    let error_msg = format!("Failed to get response body: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
-                }
+                Err(e) => (
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to get response body: {}", e),
+                    )
+                        .into_response(),
+                    false,
+                ),
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
+            self.finish_tracked_request(
+                worker_url,
+                load_incremented,
+                lifecycle.as_deref(),
+                body_ok && status.is_success(),
+            );
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
+        } else {
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
-
-            // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
+                let mut first = true;
+                let mut success = status.is_success();
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
+                            if first {
+                                if let Some(lifecycle) = lifecycle.as_deref() {
+                                    lifecycle.first_response();
                                 }
+                                first = false;
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
                         }
                         Err(e) => {
+                            success = false;
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
                     }
                 }
-                if !decremented {
+                if load_incremented {
                     if let Some(worker) = registry.get_by_url(&worker_url) {
                         worker.decrement_load();
                         RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
+                if let Some(lifecycle) = lifecycle.as_deref() {
+                    lifecycle.complete(success);
                 }
             });
-
             let stream = UnboundedReceiverStream::new(rx);
             let body = Body::from_stream(stream);
-
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
@@ -1069,16 +1030,10 @@ impl Router {
                                 let model_id = worker_arc.model_id();
                                 let policy = self.policy_registry.on_worker_added(model_id, None);
 
-                                // If this is a cache-aware policy, update it with all workers for this model
-                                if policy.name() == "cache_aware" {
-                                    if let Some(cache_aware) = policy
-                                        .as_any()
-                                        .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                                    ) {
-                                        let model_workers =
-                                            self.worker_registry.get_by_model_fast(model_id);
-                                        cache_aware.init_workers(&model_workers);
-                                    }
+                                if policy.requires_initialization() {
+                                    let model_workers =
+                                        self.worker_registry.get_by_model_fast(model_id);
+                                    policy.init_workers(&model_workers);
                                 }
 
                                 worker_added = true;
@@ -1106,17 +1061,10 @@ impl Router {
                             let model_id = worker_arc.model_id();
                             let policy = self.policy_registry.on_worker_added(model_id, None);
 
-                            // If this is a cache-aware policy, add this worker to it
-                            if policy.name() == "cache_aware" {
-                                if let Some(cache_aware) = policy
-                                    .as_any()
-                                    .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                                ) {
-                                    // Get all workers for this model
-                                    let model_workers =
-                                        self.worker_registry.get_by_model_fast(model_id);
-                                    cache_aware.init_workers(&model_workers);
-                                }
+                            if policy.requires_initialization() {
+                                let model_workers =
+                                    self.worker_registry.get_by_model_fast(model_id);
+                                policy.init_workers(&model_workers);
                             }
                         }
 
@@ -1173,6 +1121,9 @@ impl Router {
                 if w.url().starts_with(&worker_url_prefix) {
                     // Get model_id before removing
                     let model_id = w.model_id().to_string();
+                    if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                        policy.remove_worker_by_url(w.url());
+                    }
 
                     if self.worker_registry.remove_by_url(w.url()).is_some() {
                         info!("Removed worker: {}", w.url());
@@ -1188,21 +1139,8 @@ impl Router {
 
             RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
-            // If any models are using cache aware policy, remove the workers from the tree
-            // Check each removed worker's model and get its policy
             for dp_url in removed_workers.iter() {
-                if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
-                    let model_id = worker.model_id();
-                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
-                        if let Some(cache_aware) = policy
-                            .as_any()
-                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            cache_aware.remove_worker_by_url(dp_url);
-                            info!("Removed worker from cache-aware tree: {}", dp_url);
-                        }
-                    }
-                }
+                info!("Removed worker from policy state: {}", dp_url);
             }
         } else {
             // Get the worker first to extract model_id
@@ -1213,6 +1151,10 @@ impl Router {
                 return;
             };
 
+            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                policy.remove_worker_by_url(worker_url);
+            }
+
             if self.worker_registry.remove_by_url(worker_url).is_some() {
                 info!("Removed worker: {}", worker_url);
 
@@ -1222,16 +1164,7 @@ impl Router {
                 RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
             }
 
-            // If the model is using cache aware policy, remove the worker from the tree
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
-                }
-            }
+            info!("Removed worker from policy state: {}", worker_url);
         }
     }
 

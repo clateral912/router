@@ -6,7 +6,9 @@
 use crate::core::Worker;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 mod cache_aware;
 mod consistent_hash;
@@ -17,6 +19,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+mod smetric;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
@@ -27,10 +30,72 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use smetric::{
+    DecodeContract as SMetricDecodeContract, SMetricConfig, SMetricDecision,
+    SMetricExternalObservation, SMetricInstance, SMetricPolicy, SMetricRequest,
+};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
+
+/// Owns one policy reservation until an HTTP response finishes or is dropped.
+#[derive(Debug)]
+pub(crate) struct PolicyRequestLifecycle {
+    policy: Arc<dyn LoadBalancingPolicy>,
+    worker_url: String,
+    reservation_id: u64,
+    started_at: Instant,
+    completed: AtomicBool,
+}
+
+impl PolicyRequestLifecycle {
+    pub(crate) fn start(
+        policy: Arc<dyn LoadBalancingPolicy>,
+        worker_url: &str,
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<Arc<Self>> {
+        let started_at = Instant::now();
+        policy
+            .on_request_start(worker_url, request_text, headers)
+            .map(|reservation_id| {
+                Arc::new(Self {
+                    policy,
+                    worker_url: worker_url.to_string(),
+                    reservation_id,
+                    started_at,
+                    completed: AtomicBool::new(false),
+                })
+            })
+    }
+
+    pub(crate) fn first_response(&self) {
+        self.policy.on_request_first_response(
+            &self.worker_url,
+            Some(self.reservation_id),
+            self.started_at.elapsed(),
+        );
+    }
+
+    pub(crate) fn complete(&self, success: bool) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.policy.on_request_finish(
+            &self.worker_url,
+            Some(self.reservation_id),
+            success,
+            self.started_at.elapsed(),
+        );
+    }
+}
+
+impl Drop for PolicyRequestLifecycle {
+    fn drop(&mut self) {
+        self.complete(false);
+    }
+}
 
 /// Core trait for load balancing policies
 ///
@@ -97,6 +162,37 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    fn on_request_start(
+        &self,
+        _worker_url: &str,
+        _request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+    ) -> Option<u64> {
+        None
+    }
+
+    fn on_request_first_response(
+        &self,
+        _worker_url: &str,
+        _reservation_id: Option<u64>,
+        _elapsed: std::time::Duration,
+    ) {
+    }
+
+    fn on_request_finish(
+        &self,
+        worker_url: &str,
+        _reservation_id: Option<u64>,
+        success: bool,
+        _elapsed: std::time::Duration,
+    ) {
+        self.on_request_complete(worker_url, success);
+    }
+
+    fn tracks_worker_load(&self) -> bool {
+        false
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
@@ -139,6 +235,8 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn init_workers(&self, _workers: &[Arc<dyn Worker>]) {
         // Default: no-op for policies that don't need initialization
     }
+
+    fn remove_worker_by_url(&self, _url: &str) {}
 }
 
 /// Configuration for cache-aware policy
