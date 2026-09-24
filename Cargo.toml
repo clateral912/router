@@ -79,7 +79,29 @@ backoff = { version = "0.4", features = ["tokio"] }
 strum = { version = "0.26", features = ["derive"] }
 once_cell = "1.21.3"
 zmq = "0.10.0"
+lru = { version = "0.18", default-features = false }
 rmp-serde = "1.3"
+wasmtime = { version = "36", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "parallel-compilation",
+    "pooling-allocator",
+    "runtime",
+] }
+wasmtime-wasi = "36"
+sha2 = "0.10"
+async-channel = "2"
+# Must match vllm-proto (tonic 0.14 / prost 0.14). otel-otlp keeps its own
+# tonic 0.12 copy for traces.
+tonic = { version = "0.14", features = ["transport"] }
+tonic-health = "0.14"
+vllm-proto = "0.2"
+# Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo
+# finds the package by name under rust/src/. Override with a path patch
+# to a local checkout if you already have the rust workspace.
+vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
+vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -99,6 +121,11 @@ path = "benches/request_processing.rs"
 name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"
+
+[[bench]]
+name = "tokenizer_cache_benchmark"
+harness = false
+path = "benches/tokenizer_cache_benchmark.rs"
 
 [[bench]]
 name = "otel_disabled_path"

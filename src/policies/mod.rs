@@ -13,7 +13,7 @@ use std::time::Instant;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
-mod hash_key;
+pub(crate) mod hash_key;
 mod power_of_two;
 mod random;
 mod registry;
@@ -21,7 +21,7 @@ mod rendezvous_hash;
 mod round_robin;
 mod smetric;
 
-pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
@@ -190,7 +190,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     }
 
     fn tracks_worker_load(&self) -> bool {
-        false
+        self.name() == "cache_aware"
     }
 
     /// Get policy name for metrics and debugging
@@ -236,7 +236,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't need initialization
     }
 
-    fn remove_worker_by_url(&self, _url: &str) {}
+    fn remove_worker_by_url(&self, url: &str) {
+        if let Some(cache_aware) = self.as_any().downcast_ref::<CacheAwarePolicy>() {
+            cache_aware.remove_worker_by_url(url);
+        }
+    }
 }
 
 /// Configuration for cache-aware policy

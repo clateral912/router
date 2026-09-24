@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+pub mod backend;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
@@ -10,12 +11,15 @@ pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
 pub mod policies;
+pub mod program_scheduling;
 pub mod protocols;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+mod token_estimator;
 pub mod tokenizer;
 pub mod tree;
+pub mod wasm_middleware;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -75,6 +79,9 @@ struct Router {
     smetric_drain_window_secs: u64,
     smetric_drain_min_samples: usize,
     max_payload_size: usize,
+    wasm_middleware: Option<String>,
+    wasm_middleware_sha256: Option<String>,
+    wasm_middleware_routes: Vec<String>,
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
     api_key_validation_urls: Vec<String>,
@@ -129,6 +136,9 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    // Explicit Program-level scheduling feature switch and optional overrides.
+    enable_program_scheduling: bool,
+    program_scheduling_config_json: Option<String>,
 }
 
 impl Router {
@@ -335,6 +345,10 @@ impl Router {
                     });
                 }
             },
+            program_scheduling: config::ProgramSchedulingConfig::resolve(
+                self.enable_program_scheduling,
+                self.program_scheduling_config_json.as_deref(),
+            )?,
         })
     }
 }
@@ -439,6 +453,11 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        wasm_middleware = None,
+        wasm_middleware_sha256 = None,
+        wasm_middleware_routes = vec![],
+        enable_program_scheduling = false,
+        program_scheduling_config_json = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -532,7 +551,27 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        wasm_middleware: Option<String>,
+        wasm_middleware_sha256: Option<String>,
+        wasm_middleware_routes: Vec<String>,
+        enable_program_scheduling: bool,
+        program_scheduling_config_json: Option<String>,
     ) -> PyResult<Self> {
+        if wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+            && wasm_middleware
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_none()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "wasm_middleware_sha256 requires wasm_middleware",
+            ));
+        }
         Ok(Router {
             host,
             port,
@@ -577,6 +616,10 @@ impl Router {
             smetric_drain_window_secs,
             smetric_drain_min_samples,
             max_payload_size,
+            wasm_middleware,
+            wasm_middleware_sha256,
+            wasm_middleware_routes,
+            enable_program_scheduling,
             intra_node_data_parallel_size,
             api_key,
             api_key_validation_urls,
@@ -624,6 +667,7 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            program_scheduling_config_json,
         })
     }
 
@@ -679,6 +723,9 @@ impl Router {
                 port: self.port,
                 router_config,
                 max_payload_size: self.max_payload_size,
+                wasm_middleware: self.wasm_middleware.clone(),
+                wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+                wasm_middleware_routes: self.wasm_middleware_routes.clone(),
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 service_discovery_config,

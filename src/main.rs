@@ -2,9 +2,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, SMetricDrainSource, SMetricFallback, SMetricGate,
-    SMetricPolicyConfig, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, SMetricDrainSource,
+    SMetricFallback, SMetricGate, SMetricPolicyConfig, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -88,8 +88,11 @@ This launcher enables starting a router with individual worker instances. It is 
 multi-node setups or when you want to start workers and router separately.
 
 Examples:
-  # Regular mode
+  # Regular mode (HTTP reverse-proxy of OpenAI messages)
   vllm-router --worker-urls http://worker1:8000 http://worker2:8000
+
+  # Regular mode with a vLLM rust Inference worker (router sends token_ids)
+  vllm-router --worker-urls grpc://worker1:50051
 
   # vLLM PD mode with pure service discovery (workers register themselves)
   vllm-router --vllm-pd-disaggregation \
@@ -110,13 +113,23 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000)]
     port: u16,
 
-    /// List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)
+    /// List of worker URLs (`http(s)://` reverse-proxy, or `grpc://` Inference)
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     policy: String,
+
+    /// Enable Program-level scheduling independently of the request-level
+    /// load-balancing policy.
+    #[arg(long, default_value_t = false)]
+    enable_program_scheduling: bool,
+
+    /// Optional JSON object overriding Program-level scheduling defaults.
+    /// Requires --enable-program-scheduling.
+    #[arg(long)]
+    program_scheduling_config_json: Option<String>,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
@@ -234,6 +247,19 @@ struct CliArgs {
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
     max_payload_size: usize,
+
+    /// Path to a WASM Component Model OnRequest middleware artifact
+    #[arg(long)]
+    wasm_middleware: Option<String>,
+
+    /// Optional SHA-256 hex digest that must match --wasm-middleware
+    #[arg(long)]
+    wasm_middleware_sha256: Option<String>,
+
+    /// HTTP paths that invoke the WASM middleware (repeatable).
+    /// Defaults to /v1/chat/completions when --wasm-middleware is set.
+    #[arg(long = "wasm-middleware-route", action = ArgAction::Append)]
+    wasm_middleware_routes: Vec<String>,
 
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[arg(long, default_value_t = 1)]
@@ -606,6 +632,11 @@ impl CliArgs {
             Vec::new()
         };
 
+        let program_scheduling = ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
@@ -664,6 +695,7 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            program_scheduling,
         })
     }
 
@@ -698,6 +730,9 @@ impl CliArgs {
             port: self.port,
             router_config,
             max_payload_size: self.max_payload_size,
+            wasm_middleware: self.wasm_middleware.clone(),
+            wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+            wasm_middleware_routes: self.wasm_middleware_routes.clone(),
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
             service_discovery_config,
@@ -822,7 +857,31 @@ Provide --worker-urls or PD flags as usual.",
 
 #[cfg(test)]
 mod tests {
-    use super::split_prefill_args_from_others;
+    use super::*;
+
+    #[test]
+    fn parses_wasm_middleware_options() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--wasm-middleware",
+            "/tmp/example.component.wasm",
+            "--wasm-middleware-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--wasm-middleware-route",
+            "/v1/chat/completions",
+            "--wasm-middleware-route",
+            "/v1/completions",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.wasm_middleware.as_deref(),
+            Some("/tmp/example.component.wasm")
+        );
+        assert_eq!(
+            args.wasm_middleware_routes,
+            vec!["/v1/chat/completions", "/v1/completions"]
+        );
+    }
 
     #[test]
     fn splits_prefill_args_and_preserves_other_args() {

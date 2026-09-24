@@ -2,6 +2,9 @@
 
 The vLLM Router supports multiple load balancing policies for distributing requests across backend workers. Each policy is designed for different use cases and can be configured based on your deployment requirements.
 
+Worker URLs may be `http(s)://` or `grpc://`. Examples below use HTTP;
+the policy is the same for `grpc://host:port`.
+
 ## Available Policies
 
 | Policy | Best For | Session Affinity | Load Aware |

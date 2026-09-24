@@ -11,7 +11,8 @@ use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, PolicyConfig, ProgramSchedulingConfig, RetryConfig,
+    RouterConfig, RoutingMode,
 };
 use vllm_router_rs::routers::{RouterFactory, RouterTrait};
 
@@ -35,7 +36,7 @@ impl TestContext {
             port: 3002,
             max_payload_size: 256 * 1024 * 1024,
             request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
+            worker_startup_timeout_secs: 10,
             worker_startup_check_interval_secs: 1,
             discovery: None,
             intra_node_data_parallel_size: 1,
@@ -61,6 +62,7 @@ impl TestContext {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -276,6 +278,53 @@ mod health_tests {
 #[cfg(test)]
 mod generation_tests {
     use super::*;
+    use axum::{
+        extract::State,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router as AxumRouter,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn start_retry_once_chat_backend(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = AxumRouter::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State(attempts): State<Arc<AtomicUsize>>,
+                     Json(_request): Json<serde_json::Value>| async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        Json(json!({
+                            "id": "chatcmpl-retry",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 1,
+                                "total_tokens": 11
+                            }
+                        }))
+                        .into_response()
+                    },
+                ),
+            )
+            .with_state(attempts.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), attempts, handle)
+    }
 
     #[tokio::test]
     async fn test_generate_success() {
@@ -423,6 +472,117 @@ mod generation_tests {
         assert!(body_json.get("choices").is_some());
 
         ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_program_request_is_tracked_without_changing_response() {
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            ..Default::default()
+        };
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello!"}],
+            "stream": false,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program-1",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap()
+            .get("choices")
+            .is_some());
+
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics["ranks"][0]["programs"][0]["estimated_context_tokens"],
+            10
+        );
+        assert_eq!(diagnostics["ranks"][0]["programs"][0]["state"], "paused");
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_program_retry_completes_each_route_attempt_without_occupancy_leak() {
+        let (backend_url, attempts, backend_handle) = start_retry_once_chat_backend().await;
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![backend_url],
+            },
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            retry: RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            },
+            ..Default::default()
+        };
+        let ctx = TestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Retry once"}],
+            "stream": false,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "retry-program",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        assert_eq!(diagnostics["retained_requests"], 0);
+        let ranks = diagnostics["ranks"].as_array().unwrap();
+        assert_eq!(ranks.len(), 1);
+        assert_eq!(ranks[0]["router_in_flight_requests"], 0);
+        assert_eq!(ranks[0]["router_queued_requests"], 0);
+        let programs = ranks[0]["programs"].as_array().unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0]["generation"], 0);
+        assert_eq!(programs[0]["in_flight_requests"], 0);
+        assert_eq!(programs[0]["waiting_requests"], 0);
+
+        ctx.shutdown().await;
+        backend_handle.abort();
     }
 }
 
@@ -1034,6 +1194,59 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
+    async fn test_v1_responses_program_request_is_tracked() {
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            ..Default::default()
+        };
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": false,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "responses-program",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics["ranks"][0]["programs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            diagnostics["ranks"][0]["rolling"]["avg_prompt_tokens"],
+            10.0
+        );
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_v1_responses_streaming() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18951,
@@ -1367,7 +1580,7 @@ mod error_tests {
             port: 3010,
             max_payload_size: 1024, // 1KB limit
             request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
+            worker_startup_timeout_secs: 10,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
             api_key: None,
@@ -1393,6 +1606,7 @@ mod error_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1729,7 +1943,7 @@ mod pd_mode_tests {
             port: 3011,
             max_payload_size: 256 * 1024 * 1024,
             request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
+            worker_startup_timeout_secs: 10,
             worker_startup_check_interval_secs: 1,
             discovery: None,
             metrics: None,
@@ -1755,6 +1969,7 @@ mod pd_mode_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         // Create app context
@@ -1894,7 +2109,7 @@ mod request_id_tests {
             port: 3002,
             max_payload_size: 256 * 1024 * 1024,
             request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
+            worker_startup_timeout_secs: 10,
             worker_startup_check_interval_secs: 1,
             discovery: None,
             metrics: None,
@@ -1920,6 +2135,7 @@ mod request_id_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         };
 
         let ctx = TestContext::new_with_config(
