@@ -2,11 +2,11 @@ use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
-    RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    PrefillCharge, RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, SMetricPolicy};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -14,6 +14,7 @@ use crate::program_scheduling::{
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    SMetricPrompt,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -1028,6 +1029,25 @@ impl Router {
         Some(available[idx].clone())
     }
 
+    fn select_smetric_worker_for_model(
+        &self,
+        model_id: Option<&str>,
+        prompt: &SMetricPrompt,
+        turn_gate: bool,
+    ) -> Option<(Arc<dyn Worker>, u64)> {
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let policy = policy.as_any().downcast_ref::<SMetricPolicy>()?;
+        let (idx, work) = policy.select_prefill(&workers, prompt, turn_gate)?;
+        Some((workers[idx].clone(), work))
+    }
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1081,7 +1101,35 @@ impl Router {
             None
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let smetric_prompt = if policy.as_any().is::<SMetricPolicy>() {
+            match typed_req.extract_text_for_smetric() {
+                Some(prompt) => Some(prompt),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "SMetric requires a single text prompt",
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            None
+        };
+        let turn_gate = typed_req.passes_smetric_turn_gate()
+            && headers
+                .and_then(|headers| headers.get("x-session-turn"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_none_or(|turn| turn > 1);
+        let text = if smetric_prompt.is_some() {
+            String::new()
+        } else {
+            typed_req.extract_text_for_routing()
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1100,7 +1148,7 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
+                let selected = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
                         .get_by_url(target)
@@ -1108,11 +1156,23 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    Some(worker)
+                    let work = if let Some(prompt) = &smetric_prompt {
+                        let policy = policy.as_any().downcast_ref::<SMetricPolicy>().unwrap();
+                        policy
+                            .select_prefill(&[worker.clone()], prompt, turn_gate)
+                            .map(|(_, work)| work)
+                    } else {
+                        None
+                    };
+                    Some((worker, work))
+                } else if let Some(prompt) = &smetric_prompt {
+                    self.select_smetric_worker_for_model(model_id, prompt, turn_gate)
+                        .map(|(worker, work)| (worker, Some(work)))
                 } else {
                     self.select_worker_for_model(model_id, Some(&text), headers)
+                        .map(|worker| (worker, None))
                 };
-                let worker = match selected_worker {
+                let (worker, smetric_work) = match selected {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1124,7 +1184,8 @@ impl Router {
                     }
                 };
 
-                // Optional load tracking for cache-aware policy
+                let smetric_charge =
+                    smetric_work.map(|work| PrefillCharge::new(worker.clone(), work));
                 // Get the policy for this model to check if it's cache-aware
                 let policy = match model_id {
                     Some(model) => self.policy_registry.get_policy_or_default(model),
@@ -1159,6 +1220,7 @@ impl Router {
                             prepared: prepared.clone(),
                         },
                         program_completion.clone(),
+                        smetric_charge,
                     )
                     .await;
 
@@ -1339,6 +1401,7 @@ impl Router {
         typed_req: &T,
         dispatch: TypedDispatch<'_>,
         program_completion: Option<ProgramCompletion>,
+        smetric_charge: Option<PrefillCharge>,
     ) -> Response {
         let TypedDispatch {
             headers,
@@ -1381,6 +1444,16 @@ impl Router {
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
+            }
+            if is_stream && response.status().is_success() {
+                if let Some(charge) = smetric_charge {
+                    let (parts, body) = response.into_parts();
+                    let stream = body.into_data_stream().map(move |chunk| {
+                        let _hold = &charge;
+                        chunk
+                    });
+                    response = Response::from_parts(parts, Body::from_stream(stream));
+                }
             }
             return response;
         }
@@ -1564,6 +1637,7 @@ impl Router {
 
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
+                let _smetric_charge = smetric_charge;
                 let mut stream = stream;
                 let mut decremented = false;
                 let mut first_sse = true;
@@ -1645,6 +1719,7 @@ impl Router {
 
             // Spawn task to forward stream
             tokio::spawn(async move {
+                let _smetric_charge = smetric_charge;
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
