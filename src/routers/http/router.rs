@@ -6,7 +6,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry, PolicyRequest, RequestTracker};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, SMetricPolicy, SMetricPrefill};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -14,6 +14,7 @@ use crate::program_scheduling::{
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    SMetricPrompt,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -74,7 +75,7 @@ struct LoadTrackedBody {
     >,
     worker: Option<Arc<dyn Worker>>,
     producer_abort: Option<tokio::task::AbortHandle>,
-    tracker: Option<Box<dyn RequestTracker>>,
+    tracker: Option<SMetricPrefill>,
 }
 
 impl LoadTrackedBody {
@@ -116,7 +117,7 @@ impl Drop for LoadTrackedBody {
 fn hold_load_until_body_done(
     mut response: Response,
     worker: Arc<dyn Worker>,
-    tracker: Option<Box<dyn RequestTracker>>,
+    tracker: Option<SMetricPrefill>,
 ) -> Response {
     let producer = response
         .extensions_mut()
@@ -150,7 +151,7 @@ struct TypedDispatch<'a> {
     is_stream: bool,
     load_incremented: bool,
     prepared: Option<crate::backend::PreparedChat>,
-    tracker: Option<Box<dyn RequestTracker>>,
+    tracker: Option<SMetricPrefill>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -1009,9 +1010,10 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        request: &PolicyRequest<'_>,
+        request_text: Option<&str>,
+        smetric_request: Option<(&SMetricPrompt, bool)>,
         headers: Option<&HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Option<Box<dyn RequestTracker>>)> {
+    ) -> Option<(Arc<dyn Worker>, Option<SMetricPrefill>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1036,8 +1038,21 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let (idx, tracker) =
-            policy.select_worker_tracked(&available, request, request_headers.as_ref())?;
+        let (idx, tracker) = if let Some(smetric) = policy.as_any().downcast_ref::<SMetricPolicy>()
+        {
+            let (prompt, turn_gate) = smetric_request?;
+            let (idx, tracker) = smetric.select_prefill(&available, prompt, turn_gate, true)?;
+            (idx, Some(tracker))
+        } else {
+            (
+                policy.select_worker_with_headers(
+                    &available,
+                    request_text,
+                    request_headers.as_ref(),
+                )?,
+                None,
+            )
+        };
         Some((available[idx].clone(), tracker))
     }
 
@@ -1098,7 +1113,8 @@ impl Router {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
-        let smetric_prompt = if policy.needs_smetric_prompt() {
+        let smetric = policy.as_any().downcast_ref::<SMetricPolicy>();
+        let smetric_prompt = if smetric.is_some() {
             match typed_req.extract_text_for_smetric() {
                 Some(prompt) => Some(prompt),
                 None => {
@@ -1122,12 +1138,6 @@ impl Router {
             String::new()
         } else {
             typed_req.extract_text_for_routing()
-        };
-        let request = PolicyRequest {
-            text: Some(&text),
-            smetric_prompt: smetric_prompt.as_ref(),
-            turn_gate,
-            colocated: true,
         };
 
         let response = RetryExecutor::execute_response_with_retry(
@@ -1155,15 +1165,22 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    if policy.needs_smetric_prompt() {
-                        policy
-                            .select_worker_tracked(&[worker.clone()], &request, None)
-                            .map(|(_, tracker)| (worker, tracker))
+                    if let Some(smetric) = smetric {
+                        smetric_prompt.as_ref().and_then(|prompt| {
+                            smetric
+                                .select_prefill(&[worker.clone()], prompt, turn_gate, true)
+                                .map(|(_, tracker)| (worker, Some(tracker)))
+                        })
                     } else {
                         Some((worker, None))
                     }
                 } else {
-                    self.select_worker_for_model(model_id, &request, headers)
+                    self.select_worker_for_model(
+                        model_id,
+                        Some(&text),
+                        smetric_prompt.as_ref().map(|prompt| (prompt, turn_gate)),
+                        headers,
+                    )
                 };
                 let (worker, tracker) = match selected {
                     Some(w) => w,
@@ -2516,7 +2533,7 @@ impl RouterTrait for Router {
                 .filter(|worker| worker.is_available())
         } else {
             let policy = self.policy_registry.get_default_policy();
-            if policy.needs_smetric_prompt() {
+            if policy.as_any().is::<SMetricPolicy>() {
                 return (
                     StatusCode::BAD_REQUEST,
                     "SMetric supports text chat and completion prompts only",
@@ -3097,12 +3114,8 @@ mod tests {
             let (worker, _) = router
                 .select_worker_for_model(
                     None,
-                    &PolicyRequest {
-                        text: Some(r#"{"prompt": "test"}"#),
-                        smetric_prompt: None,
-                        turn_gate: false,
-                        colocated: true,
-                    },
+                    Some(r#"{"prompt": "test"}"#),
+                    None,
                     Some(&header_map),
                 )
                 .expect("Should select a worker");
@@ -3134,16 +3147,7 @@ mod tests {
         }
 
         let (worker, _) = router
-            .select_worker_for_model(
-                None,
-                &PolicyRequest {
-                    text: Some(r#"{"prompt": "test"}"#),
-                    smetric_prompt: None,
-                    turn_gate: false,
-                    colocated: true,
-                },
-                None,
-            )
+            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None)
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -3164,16 +3168,8 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(
-            None,
-            &PolicyRequest {
-                text: Some(r#"{"prompt": "test"}"#),
-                smetric_prompt: None,
-                turn_gate: false,
-                colocated: true,
-            },
-            None,
-        );
+        let result =
+            router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None);
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -3193,12 +3189,8 @@ mod tests {
 
             if let Some((worker, _)) = router.select_worker_for_model(
                 None,
-                &PolicyRequest {
-                    text: Some(r#"{"prompt": "test"}"#),
-                    smetric_prompt: None,
-                    turn_gate: false,
-                    colocated: true,
-                },
+                Some(r#"{"prompt": "test"}"#),
+                None,
                 Some(&header_map),
             ) {
                 worker_urls_seen.insert(worker.url().to_string());

@@ -9,7 +9,7 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{PolicyRegistry, PolicyRequest, RequestTracker};
+use crate::policies::{PolicyRegistry, SMetricPolicy, SMetricPrefill};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerationRequest, SMetricPrompt,
 };
@@ -1290,25 +1290,23 @@ impl VllmPDRouter {
         turn_gate: bool,
         request_text: Option<&str>,
         headers: Option<&HashMap<String, String>>,
-    ) -> Option<(usize, Option<Box<dyn RequestTracker>>)> {
+    ) -> Option<(usize, Option<SMetricPrefill>)> {
         let policy = self.policy_registry.get_prefill_policy();
-        policy.select_worker_tracked(
-            workers,
-            &PolicyRequest {
-                text: request_text,
-                smetric_prompt: prompt,
-                turn_gate,
-                colocated: false,
-            },
-            headers,
-        )
+        if let Some(smetric) = policy.as_any().downcast_ref::<SMetricPolicy>() {
+            let (idx, tracker) = smetric.select_prefill(workers, prompt?, turn_gate, false)?;
+            Some((idx, Some(tracker)))
+        } else {
+            policy
+                .select_worker_with_headers(workers, request_text, headers)
+                .map(|idx| (idx, None))
+        }
     }
 
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
-        mut prefill_tracker: Option<Box<dyn RequestTracker>>,
+        mut prefill_tracker: Option<SMetricPrefill>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -1753,7 +1751,7 @@ impl VllmPDRouter {
         prefill_request: Value,
         decode_request: Value,
         prefill_worker: Arc<dyn Worker>,
-        prefill_tracker: Option<Box<dyn RequestTracker>>,
+        prefill_tracker: Option<SMetricPrefill>,
         decode_worker: Arc<dyn Worker>,
         request_id: String,
         path: &str,
@@ -2287,7 +2285,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let smetric_prompt = if prefill_policy.needs_smetric_prompt() {
+            let smetric_prompt = if prefill_policy.as_any().is::<SMetricPolicy>() {
                 match body.extract_text_for_smetric() {
                     Some(prompt) => Some(prompt),
                     None => {
@@ -2472,7 +2470,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let smetric_prompt = if prefill_policy.needs_smetric_prompt() {
+            let smetric_prompt = if prefill_policy.as_any().is::<SMetricPolicy>() {
                 match body.extract_text_for_smetric() {
                     Some(prompt) => Some(prompt),
                     None => {
@@ -2711,7 +2709,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let smetric_request = if prefill_policy.needs_smetric_prompt() {
+            let smetric_request = if prefill_policy.as_any().is::<SMetricPolicy>() {
                 match path {
                     "/v1/chat/completions" => {
                         serde_json::from_value::<ChatCompletionRequest>(request_json.clone())
@@ -2734,7 +2732,7 @@ impl RouterTrait for VllmPDRouter {
             } else {
                 None
             };
-            if prefill_policy.needs_smetric_prompt() && smetric_request.is_none() {
+            if prefill_policy.as_any().is::<SMetricPolicy>() && smetric_request.is_none() {
                 return (
                     StatusCode::BAD_REQUEST,
                     "SMetric supports single text chat or completion prompts only",

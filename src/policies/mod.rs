@@ -4,7 +4,6 @@
 //! across both regular and prefill-decode (PD) routing modes.
 
 use crate::core::Worker;
-use crate::protocols::spec::SMetricPrompt;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -29,25 +28,11 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use smetric::SMetricPolicy;
+pub use smetric::{SMetricPolicy, SMetricPrefill};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
-
-/// Request data available to policies without forcing other policies to parse a body.
-pub struct PolicyRequest<'a> {
-    pub text: Option<&'a str>,
-    pub smetric_prompt: Option<&'a SMetricPrompt>,
-    pub turn_gate: bool,
-    /// False for disaggregated prefill, where decode runs on another worker.
-    pub colocated: bool,
-}
-
-/// Tracks prefill work until the first output or a failed/cancelled request.
-pub trait RequestTracker: Send {
-    fn on_first_token(&mut self);
-}
 
 /// Core trait for load balancing policies
 ///
@@ -77,16 +62,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
-
-    fn select_worker_tracked(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request: &PolicyRequest<'_>,
-        headers: Option<&RequestHeaders>,
-    ) -> Option<(usize, Option<Box<dyn RequestTracker>>)> {
-        self.select_worker_with_headers(workers, request.text, headers)
-            .map(|idx| (idx, None))
-    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
@@ -130,10 +105,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
-    }
-
-    fn needs_smetric_prompt(&self) -> bool {
-        false
     }
 
     /// Check if this policy needs HTTP headers for routing decisions

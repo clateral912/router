@@ -1,5 +1,5 @@
 //! SMetric: session cache affinity with a prefill-work fallback.
-use super::{LoadBalancingPolicy, PolicyRequest, RequestHeaders, RequestTracker};
+use super::{LoadBalancingPolicy, RequestHeaders};
 use crate::config::SMetricConfig;
 use crate::core::{PrefillCharge, Worker};
 use crate::metrics::RouterMetrics;
@@ -43,13 +43,13 @@ impl SMetricPolicy {
         }
     }
 
-    fn select_prefill(
+    pub fn select_prefill(
         &self,
         workers: &[Arc<dyn Worker>],
         prompt: &SMetricPrompt,
         passes_turn_gate: bool,
         colocated: bool,
-    ) -> Option<(usize, u64)> {
+    ) -> Option<(usize, SMetricPrefill)> {
         let l = prompt.text.chars().count();
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % workers.len().max(1);
         let mut min: Option<(usize, u64, u64)> = None; // index, score, own cost
@@ -113,7 +113,25 @@ impl SMetricPolicy {
         }
         RouterMetrics::record_processed_request(workers[idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-        Some((idx, cost))
+        let rates = if self.config.prefill_rate.is_none() {
+            Some(
+                self.rates
+                    .entry(workers[idx].url().to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(RateHistory::default())))
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        Some((
+            idx,
+            SMetricPrefill {
+                charge: Some(PrefillCharge::new(workers[idx].clone(), cost)),
+                work: cost,
+                started: Instant::now(),
+                rates,
+            },
+        ))
     }
 }
 
@@ -140,15 +158,15 @@ impl RateHistory {
     }
 }
 
-struct SMetricTracker {
+pub struct SMetricPrefill {
     charge: Option<PrefillCharge>,
     work: u64,
     started: Instant,
     rates: Option<Arc<Mutex<RateHistory>>>,
 }
 
-impl RequestTracker for SMetricTracker {
-    fn on_first_token(&mut self) {
+impl SMetricPrefill {
+    pub fn on_first_token(&mut self) {
         let Some(charge) = self.charge.take() else {
             return;
         };
@@ -170,38 +188,6 @@ impl LoadBalancingPolicy for SMetricPolicy {
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         None
-    }
-
-    fn select_worker_tracked(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request: &PolicyRequest<'_>,
-        _headers: Option<&RequestHeaders>,
-    ) -> Option<(usize, Option<Box<dyn RequestTracker>>)> {
-        let prompt = request.smetric_prompt?;
-        let (idx, work) =
-            self.select_prefill(workers, prompt, request.turn_gate, request.colocated)?;
-        let rates = if self.config.prefill_rate.is_none() {
-            Some(
-                self.rates
-                    .entry(workers[idx].url().to_string())
-                    .or_insert_with(|| Arc::new(Mutex::new(RateHistory::default())))
-                    .clone(),
-            )
-        } else {
-            None
-        };
-        let tracker = SMetricTracker {
-            charge: Some(PrefillCharge::new(workers[idx].clone(), work)),
-            work,
-            started: Instant::now(),
-            rates,
-        };
-        Some((idx, Some(Box::new(tracker))))
-    }
-
-    fn needs_smetric_prompt(&self) -> bool {
-        true
     }
 
     fn name(&self) -> &'static str {
@@ -229,20 +215,10 @@ mod tests {
         prompt: &SMetricPrompt,
         turn_gate: bool,
         colocated: bool,
-    ) -> (usize, Box<dyn RequestTracker>) {
-        let (idx, tracker) = policy
-            .select_worker_tracked(
-                workers,
-                &PolicyRequest {
-                    text: None,
-                    smetric_prompt: Some(prompt),
-                    turn_gate,
-                    colocated,
-                },
-                None,
-            )
-            .unwrap();
-        (idx, tracker.unwrap())
+    ) -> (usize, SMetricPrefill) {
+        policy
+            .select_prefill(workers, prompt, turn_gate, colocated)
+            .unwrap()
     }
 
     #[test]
