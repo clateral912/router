@@ -6,7 +6,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, SMetricPolicy, SMetricPrefill};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -14,6 +14,7 @@ use crate::program_scheduling::{
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    SMetricPrompt,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -74,6 +75,7 @@ struct LoadTrackedBody {
     >,
     worker: Option<Arc<dyn Worker>>,
     producer_abort: Option<tokio::task::AbortHandle>,
+    tracker: Option<SMetricPrefill>,
 }
 
 impl LoadTrackedBody {
@@ -90,6 +92,11 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
+        if matches!(&item, Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty()) {
+            if let Some(mut tracker) = self.tracker.take() {
+                tracker.on_first_token();
+            }
+        }
         if matches!(item, Poll::Ready(None)) {
             self.release();
             self.producer_abort.take();
@@ -107,7 +114,11 @@ impl Drop for LoadTrackedBody {
     }
 }
 
-fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+fn hold_load_until_body_done(
+    mut response: Response,
+    worker: Arc<dyn Worker>,
+    tracker: Option<SMetricPrefill>,
+) -> Response {
     let producer = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>()
@@ -128,6 +139,7 @@ fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) ->
         inner: Box::pin(body.into_data_stream()),
         worker: fallback_worker,
         producer_abort,
+        tracker,
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -139,6 +151,7 @@ struct TypedDispatch<'a> {
     is_stream: bool,
     load_incremented: bool,
     prepared: Option<crate::backend::PreparedChat>,
+    tracker: Option<SMetricPrefill>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -997,9 +1010,10 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        request_text: Option<&str>,
+        smetric_request: Option<(&SMetricPrompt, bool)>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<SMetricPrefill>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1024,8 +1038,22 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, tracker) = if let Some(smetric) = policy.as_any().downcast_ref::<SMetricPolicy>()
+        {
+            let (prompt, turn_gate) = smetric_request?;
+            let (idx, tracker) = smetric.select_prefill(&available, prompt, turn_gate, true)?;
+            (idx, Some(tracker))
+        } else {
+            (
+                policy.select_worker_with_headers(
+                    &available,
+                    request_text,
+                    request_headers.as_ref(),
+                )?,
+                None,
+            )
+        };
+        Some((available[idx].clone(), tracker))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1081,7 +1109,36 @@ impl Router {
             None
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let smetric = policy.as_any().downcast_ref::<SMetricPolicy>();
+        let smetric_prompt = if smetric.is_some() {
+            match typed_req.extract_text_for_smetric() {
+                Some(prompt) => Some(prompt),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "SMetric requires a single text prompt",
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            None
+        };
+        let turn_gate = typed_req.passes_smetric_turn_gate()
+            && headers
+                .and_then(|headers| headers.get("x-session-turn"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_none_or(|turn| turn > 1);
+        let text = if smetric_prompt.is_some() {
+            String::new()
+        } else {
+            typed_req.extract_text_for_routing()
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1100,7 +1157,7 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
+                let selected = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
                         .get_by_url(target)
@@ -1108,11 +1165,24 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    Some(worker)
+                    if let Some(smetric) = smetric {
+                        smetric_prompt.as_ref().and_then(|prompt| {
+                            smetric
+                                .select_prefill(&[worker.clone()], prompt, turn_gate, true)
+                                .map(|(_, tracker)| (worker, Some(tracker)))
+                        })
+                    } else {
+                        Some((worker, None))
+                    }
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model(
+                        model_id,
+                        Some(&text),
+                        smetric_prompt.as_ref().map(|prompt| (prompt, turn_gate)),
+                        headers,
+                    )
                 };
-                let worker = match selected_worker {
+                let (worker, tracker) = match selected {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1124,21 +1194,16 @@ impl Router {
                     }
                 };
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
+                let load_incremented = if policy.name() == "cache_aware"
+                    || program_completion.is_some()
+                    || tracker.is_some()
+                {
+                    worker.increment_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    true
+                } else {
+                    false
                 };
-
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
 
                 // Keep a clone for potential cleanup on retry
                 let worker_for_cleanup = if load_incremented {
@@ -1157,6 +1222,7 @@ impl Router {
                             is_stream,
                             load_incremented,
                             prepared: prepared.clone(),
+                            tracker,
                         },
                         program_completion.clone(),
                     )
@@ -1347,6 +1413,7 @@ impl Router {
             is_stream,
             load_incremented,
             prepared,
+            tracker,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -1372,7 +1439,7 @@ impl Router {
             {
                 if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                     if is_stream && response.status().is_success() {
-                        response = hold_load_until_body_done(response, worker);
+                        response = hold_load_until_body_done(response, worker, tracker);
                     } else {
                         worker.decrement_load();
                         RouterMetrics::set_running_requests(worker_url, worker.load());
@@ -1514,14 +1581,6 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
@@ -1561,9 +1620,11 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tracker = if status.is_success() { tracker } else { None };
 
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
+                let mut tracker = tracker;
                 let mut stream = stream;
                 let mut decremented = false;
                 let mut first_sse = true;
@@ -1571,6 +1632,11 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if !bytes.is_empty() {
+                                if let Some(mut tracker) = tracker.take() {
+                                    tracker.on_first_token();
+                                }
+                            }
                             if first_sse {
                                 first_sse = false;
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -1583,10 +1649,11 @@ impl Router {
                                 completion.observe_sse_chunk(&bytes);
                             }
                             // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
+                            if !decremented
+                                && bytes
+                                    .as_ref()
+                                    .windows(12)
+                                    .any(|window| window == b"data: [DONE]")
                             {
                                 if let Some(worker) = registry.get_by_url(&worker_url) {
                                     worker.decrement_load();
@@ -2466,6 +2533,13 @@ impl RouterTrait for Router {
                 .filter(|worker| worker.is_available())
         } else {
             let policy = self.policy_registry.get_default_policy();
+            if policy.as_any().is::<SMetricPolicy>() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "SMetric supports text chat and completion prompts only",
+                )
+                    .into_response();
+            }
             let request_headers = Self::headers_to_request_headers(headers);
             policy
                 .select_worker_with_headers(
@@ -2867,14 +2941,14 @@ mod tests {
 
         worker.increment_load();
         let response =
-            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone(), None);
         assert_eq!(worker.load(), 1);
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(worker.load(), 0);
 
         worker.increment_load();
         let response =
-            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone(), None);
         assert_eq!(worker.load(), 1);
         drop(response);
         assert_eq!(worker.load(), 0);
@@ -2896,7 +2970,7 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(response, worker.clone(), None);
         finish_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -2915,7 +2989,7 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(response, worker.clone(), None);
         drop(response);
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -3037,8 +3111,13 @@ mod tests {
         // Make multiple selections with the same headers - should all pick the same worker
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
-            let worker = router
-                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
+            let (worker, _) = router
+                .select_worker_for_model(
+                    None,
+                    Some(r#"{"prompt": "test"}"#),
+                    None,
+                    Some(&header_map),
+                )
                 .expect("Should select a worker");
             selected_urls.push(worker.url().to_string());
         }
@@ -3067,8 +3146,8 @@ mod tests {
             }
         }
 
-        let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+        let (worker, _) = router
+            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None)
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -3089,7 +3168,8 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        let result =
+            router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None);
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -3107,9 +3187,10 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some((worker, _)) = router.select_worker_for_model(
                 None,
                 Some(r#"{"prompt": "test"}"#),
+                None,
                 Some(&header_map),
             ) {
                 worker_urls_seen.insert(worker.url().to_string());

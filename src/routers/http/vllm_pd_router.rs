@@ -9,7 +9,10 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{PolicyRegistry, SMetricPolicy, SMetricPrefill};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerationRequest, SMetricPrompt,
+};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -74,6 +77,14 @@ const MORIIO_TRANSFER_PREFIX: &str = "tx";
 /// reports success before a discovered prefill/decode pair can serve requests.
 fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
+}
+
+fn passes_smetric_turn_header(headers: Option<&HeaderMap>) -> bool {
+    headers
+        .and_then(|headers| headers.get("x-session-turn"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_none_or(|turn| turn > 1)
 }
 
 /// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.
@@ -1271,15 +1282,31 @@ impl VllmPDRouter {
         .await
     }
 
-    /// Two-stage request processing for vLLM disaggregated mode
-    ///
-    /// This function handles fine-grained load tracking: the prefill worker's load is only
-    /// incremented during the prefill phase, and the decode worker's load is only incremented
-    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    /// Select prefill workers using the configured policy and track pending prefill work.
+    fn choose_prefill(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        prompt: Option<&SMetricPrompt>,
+        turn_gate: bool,
+        request_text: Option<&str>,
+        headers: Option<&HashMap<String, String>>,
+    ) -> Option<(usize, Option<SMetricPrefill>)> {
+        let policy = self.policy_registry.get_prefill_policy();
+        if let Some(smetric) = policy.as_any().downcast_ref::<SMetricPolicy>() {
+            let (idx, tracker) = smetric.select_prefill(workers, prompt?, turn_gate, false)?;
+            Some((idx, Some(tracker)))
+        } else {
+            policy
+                .select_worker_with_headers(workers, request_text, headers)
+                .map(|idx| (idx, None))
+        }
+    }
+
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
+        mut prefill_tracker: Option<SMetricPrefill>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -1296,6 +1323,7 @@ impl VllmPDRouter {
                     prefill_request,
                     decode_request,
                     prefill_worker,
+                    prefill_tracker,
                     decode_worker,
                     request_id,
                     path,
@@ -1425,6 +1453,7 @@ impl VllmPDRouter {
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
         );
+        let prefill_succeeded = prefill_response.status().is_success();
 
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
@@ -1475,6 +1504,12 @@ impl VllmPDRouter {
         self.stop_profiling(&prefill_base_url).await;
 
         // Prefill phase complete: decrement prefill load, increment decode load
+        if prefill_succeeded {
+            if let Some(tracker) = &mut prefill_tracker {
+                tracker.on_first_token();
+            }
+        }
+        drop(prefill_tracker);
         prefill_worker.decrement_load();
         decode_worker.increment_load();
 
@@ -1716,6 +1751,7 @@ impl VllmPDRouter {
         prefill_request: Value,
         decode_request: Value,
         prefill_worker: Arc<dyn Worker>,
+        prefill_tracker: Option<SMetricPrefill>,
         decode_worker: Arc<dyn Worker>,
         request_id: String,
         path: &str,
@@ -1749,8 +1785,9 @@ impl VllmPDRouter {
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
-        let (prefill_result, decode_result) = tokio::join!(
-            otel_http::send_client_request(
+        let prefill_future = async {
+            let mut prefill_tracker = prefill_tracker;
+            let response = otel_http::send_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
                 headers,
                 ClientRequestOptions {
@@ -1759,7 +1796,26 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("prefill"),
                 },
-            ),
+            )
+            .await;
+            let result = match response {
+                Ok(resp) if resp.status().is_success() => Ok(Ok(resp
+                    .bytes()
+                    .await
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok()))),
+                Ok(resp) => Ok(Err(resp.status())),
+                Err(error) => Err(error),
+            };
+            if matches!(&result, Ok(Ok(Some(_)))) {
+                if let Some(tracker) = &mut prefill_tracker {
+                    tracker.on_first_token();
+                }
+            }
+            result
+        };
+        let (prefill_result, decode_result) = tokio::join!(
+            prefill_future,
             otel_http::send_client_request(
                 stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
                 headers,
@@ -1776,12 +1832,8 @@ impl VllmPDRouter {
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
-            Ok(resp) if resp.status().is_success() => resp
-                .bytes()
-                .await
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
-            Ok(resp) => {
+            Ok(Ok(json)) => json,
+            Ok(Err(status)) => {
                 decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1790,8 +1842,7 @@ impl VllmPDRouter {
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",
-                        prefill_url,
-                        resp.status()
+                        prefill_url, status
                     ),
                 });
             }
@@ -2234,8 +2285,21 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let smetric_prompt = if prefill_policy.as_any().is::<SMetricPolicy>() {
+                match body.extract_text_for_smetric() {
+                    Some(prompt) => Some(prompt),
+                    None => {
+                        return (StatusCode::BAD_REQUEST, "SMetric requires text-only chat")
+                            .into_response()
+                    }
+                }
+            } else {
+                None
+            };
+            let (prefill_idx, prefill_tracker) = match self.choose_prefill(
                 &prefill_workers,
+                smetric_prompt.as_ref(),
+                body.passes_smetric_turn_gate() && passes_smetric_turn_header(headers),
                 request_str,
                 request_headers.as_ref(),
             ) {
@@ -2284,6 +2348,7 @@ impl RouterTrait for VllmPDRouter {
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
+                    prefill_tracker,
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
@@ -2405,8 +2470,24 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let smetric_prompt = if prefill_policy.as_any().is::<SMetricPolicy>() {
+                match body.extract_text_for_smetric() {
+                    Some(prompt) => Some(prompt),
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "SMetric requires a single text prompt",
+                        )
+                            .into_response()
+                    }
+                }
+            } else {
+                None
+            };
+            let (prefill_idx, prefill_tracker) = match self.choose_prefill(
                 &prefill_workers,
+                smetric_prompt.as_ref(),
+                body.passes_smetric_turn_gate() && passes_smetric_turn_header(headers),
                 request_str,
                 request_headers.as_ref(),
             ) {
@@ -2455,6 +2536,7 @@ impl RouterTrait for VllmPDRouter {
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
+                    prefill_tracker,
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
@@ -2627,8 +2709,41 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let smetric_request = if prefill_policy.as_any().is::<SMetricPolicy>() {
+                match path {
+                    "/v1/chat/completions" => {
+                        serde_json::from_value::<ChatCompletionRequest>(request_json.clone())
+                            .ok()
+                            .and_then(|req| {
+                                req.extract_text_for_smetric()
+                                    .map(|p| (p, req.passes_smetric_turn_gate()))
+                            })
+                    }
+                    "/v1/completions" => {
+                        serde_json::from_value::<CompletionRequest>(request_json.clone())
+                            .ok()
+                            .and_then(|req| {
+                                req.extract_text_for_smetric()
+                                    .map(|p| (p, req.passes_smetric_turn_gate()))
+                            })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if prefill_policy.as_any().is::<SMetricPolicy>() && smetric_request.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "SMetric supports single text chat or completion prompts only",
+                )
+                    .into_response();
+            }
+            let (prefill_idx, prefill_tracker) = match self.choose_prefill(
                 &prefill_workers,
+                smetric_request.as_ref().map(|(p, _)| p),
+                smetric_request.as_ref().is_some_and(|(_, gate)| *gate)
+                    && passes_smetric_turn_header(headers),
                 request_str,
                 request_headers.as_ref(),
             ) {
@@ -2673,6 +2788,7 @@ impl RouterTrait for VllmPDRouter {
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
+                    prefill_tracker,
                     decode_worker.clone(),
                     path,
                     headers,
