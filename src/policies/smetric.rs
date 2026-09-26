@@ -1,4 +1,4 @@
-//! SMetric Figure 13: session cache affinity with a prefill-work fallback.
+//! SMetric: session cache affinity with a prefill-work fallback.
 use super::{LoadBalancingPolicy, RequestHeaders};
 use crate::config::SMetricConfig;
 use crate::core::Worker;

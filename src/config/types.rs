@@ -637,7 +637,6 @@ impl RoutingMode {
     }
 }
 
-/// SMetric Figure 13 parameters. Cost and TTFT length use character counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub struct SMetricConfig {

@@ -119,7 +119,7 @@ struct CliArgs {
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
     policy: String,
-    /// YAML file of Figure 13 SMetric hyperparameters (required when SMetric is selected)
+    /// YAML file of SMetric parameters (required when SMetric is selected)
     #[arg(long)]
     smetric_config: Option<std::path::PathBuf>,
 

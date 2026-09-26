@@ -14,7 +14,6 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `smetric` | Figure 13 prefill placement | Yes (history prefix) | Yes (estimated prefill work) |
 
 ---
 
@@ -239,42 +238,6 @@ vllm-router --policy cache_aware \
 - Multi-tenant deployments with distinct prompt patterns
 
 ---
-
-## SMetric (Figure 13)
-
-Provide calibrated coefficients in a YAML file, for example
-[`examples/configs/smetric.yaml`](../../examples/configs/smetric.yaml). Values there are
-illustrative, not measured defaults:
-
-```bash
-vllm-router --policy smetric --smetric-config examples/configs/smetric.yaml \
-  --worker-urls http://worker1:8000 http://worker2:8000
-
-vllm-router --vllm-pd-disaggregation --prefill http://prefill1:8000 \
-  --prefill http://prefill2:8000 --decode http://decode1:8000 \
-  --prefill-policy smetric --decode-policy round_robin \
-  --smetric-config examples/configs/smetric.yaml
-```
-
-The YAML requires `C_LIN`, `C_ATT`, `PREFILL_RATE`, `SLACK`, `HIT_RATIO`,
-`TTFT_SLO_BASE`, and `TTFT_SLO_PER_CHAR`. The TTFT bound is
-`TTFT_SLO_BASE + TTFT_SLO_PER_CHAR * L` seconds, where `L` is the
-character count of the text prompt. Optional `MAX_TREE_SIZE` bounds historical
-text per worker (default 100000).
-
-SMetric reconstructs an append-only chat history and estimates each worker's
-cached prefix from the router's text tree. A continuation can retain cache
-affinity when its historical prefix passes `HIT_RATIO` and either that worker
-meets the TTFT gate or no worker does. Otherwise it selects the least-work worker.
-When supplied, `X-Session-Turn: 1` excludes the first turn from cache affinity.
-Queued prefill work is released after the full request in regular mode and
-after prefill in P/D mode.
-
-This standalone implementation does not subscribe to KV cache events: the
-text-tree match is an estimate, not confirmed worker cache residency. It
-accepts text-only chat and single text completions; token-ID, batched and
-multimodal prompts are unsupported. In P/D mode, choose a separate decode
-policy; vLLM ZMQ worker discovery cannot preserve SMetric's queue estimate.
 
 ## Choosing a Policy
 
