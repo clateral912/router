@@ -642,7 +642,7 @@ impl RoutingMode {
 pub struct SMetricConfig {
     pub c_lin: f64,
     pub c_att: f64,
-    pub prefill_rate: f64,
+    pub prefill_rate: Option<f64>,
     pub slack: f64,
     pub hit_ratio: f64,
     /// ttft_slo(req) = base + per_char * L, where L is the text character count.

@@ -353,10 +353,19 @@ impl ConfigValidator {
                 }
             }
             PolicyConfig::SMetric { config } => {
+                if config
+                    .prefill_rate
+                    .is_some_and(|rate| !rate.is_finite() || rate <= 0.0)
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "PREFILL_RATE".into(),
+                        value: format!("{:?}", config.prefill_rate),
+                        reason: "Must be finite and positive when configured".into(),
+                    });
+                }
                 for (field, value, positive) in [
                     ("C_LIN", config.c_lin, false),
                     ("C_ATT", config.c_att, false),
-                    ("PREFILL_RATE", config.prefill_rate, true),
                     ("SLACK", config.slack, true),
                     ("HIT_RATIO", config.hit_ratio, false),
                     ("TTFT_SLO_BASE", config.ttft_slo_base, false),
