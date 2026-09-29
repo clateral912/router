@@ -1168,7 +1168,12 @@ impl Router {
                     if let Some(smetric) = smetric {
                         smetric_prompt.as_ref().and_then(|prompt| {
                             smetric
-                                .select_prefill(&[worker.clone()], prompt, turn_gate, true)
+                                .select_prefill(
+                                    std::slice::from_ref(&worker),
+                                    prompt,
+                                    turn_gate,
+                                    true,
+                                )
                                 .map(|(_, tracker)| (worker, Some(tracker)))
                         })
                     } else {
