@@ -1182,7 +1182,7 @@ impl Router {
                         headers,
                     )
                 };
-                let (worker, tracker) = match selected {
+                let (worker, mut tracker) = match selected {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1193,6 +1193,19 @@ impl Router {
                             .into_response();
                     }
                 };
+                static DECISION_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DECISION_LOG.get_or_init(|| std::env::var_os("SMETRIC_DECISION_LOG").is_some()) {
+                    let request_id = headers.and_then(|h| h.get("x-request-id")).and_then(|v| v.to_str().ok()).unwrap_or("");
+                    let session_id = headers.and_then(|h| h.get("x-session-id")).and_then(|v| v.to_str().ok()).unwrap_or("");
+                    let turn = headers.and_then(|h| h.get("x-session-turn")).and_then(|v| v.to_str().ok()).unwrap_or("");
+                    if let Some(tracker) = &mut tracker {
+                        tracker.record_decision(request_id, session_id, turn);
+                    }
+                    eprintln!("ROUTING_DECISION_JSON {}", serde_json::json!({
+                        "request_id": request_id, "session_id": session_id, "turn": turn,
+                        "selected_worker": worker.url(), "policy": policy.name(),
+                    }));
+                }
 
                 let load_incremented = if policy.name() == "cache_aware"
                     || program_completion.is_some()

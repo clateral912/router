@@ -18,6 +18,7 @@ pub struct SMetricPolicy {
     trees: Arc<DashMap<String, Arc<Tree>>>,
     round_robin: AtomicUsize,
     rates: DashMap<String, Arc<Mutex<RateHistory>>>,
+    decision_log: bool,
 }
 
 impl SMetricPolicy {
@@ -40,6 +41,7 @@ impl SMetricPolicy {
             trees,
             rates: DashMap::new(),
             round_robin: AtomicUsize::new(0),
+            decision_log: std::env::var_os("SMETRIC_DECISION_LOG").is_some(),
         }
     }
 
@@ -55,6 +57,7 @@ impl SMetricPolicy {
         let mut min: Option<(usize, u64, u64)> = None; // index, score, own cost
         let mut prev: Option<(usize, usize, u64, bool)> = None; // index, hit, own cost, TTFT
         let mut any_meets_ttft = false;
+        let mut candidates = self.decision_log.then(|| Vec::with_capacity(workers.len()));
         for offset in 0..workers.len() {
             let idx = (start + offset) % workers.len();
             let worker = &workers[idx];
@@ -71,7 +74,8 @@ impl SMetricPolicy {
             let n = (l - hit) as f64;
             let cost = (self.config.c_lin * n + self.config.c_att * n * (l as f64 - n / 2.0)).ceil()
                 as u64;
-            let queued = worker.pending_prefill_work().saturating_add(cost);
+            let pending = worker.pending_prefill_work();
+            let queued = pending.saturating_add(cost);
             let rate = self.config.prefill_rate.or_else(|| {
                 self.rates
                     .get(worker.url())
@@ -83,11 +87,19 @@ impl SMetricPolicy {
                         * (self.config.ttft_slo_base + self.config.ttft_slo_per_char * l as f64)
             });
             any_meets_ttft |= meets;
+            let load = if colocated { worker.load() as u64 } else { 0 };
             let score = if colocated {
-                queued.saturating_mul(worker.load() as u64)
+                queued.saturating_mul(load)
             } else {
                 queued
             };
+            if let Some(candidates) = &mut candidates {
+                candidates.push(serde_json::json!({
+                    "worker": worker.url(), "hit": hit, "own_work": cost,
+                    "pending_work": pending, "load": load, "rate": rate,
+                    "meets": meets, "score": score,
+                }));
+            }
             if min.is_none_or(|(_, best, _)| score < best) {
                 min = Some((idx, score, cost));
             }
@@ -130,6 +142,21 @@ impl SMetricPolicy {
                 work: cost,
                 started: Instant::now(),
                 rates,
+                decision: candidates.map(|candidates| serde_json::json!({
+                    "selected_worker": workers[idx].url(),
+                    "home_worker": workers[prev_idx].url(),
+                    "fallback_worker": workers[min_idx].url(),
+                    "reason": if !passes_turn_gate { "first_turn" }
+                        else if (hit as f64) <= self.config.hit_ratio * prompt.est_hit_chars as f64 { "low_hit" }
+                        else if prev_meets { "home_meets" }
+                        else if !any_meets_ttft { "none_meets_stick" }
+                        else { "home_rejected" },
+                    "any_meets": any_meets_ttft, "home_meets": prev_meets,
+                    "chars": l, "est_hit_chars": prompt.est_hit_chars,
+                    "gate_budget": self.config.slack * (self.config.ttft_slo_base + self.config.ttft_slo_per_char * l as f64),
+                    "colocated": colocated, "candidates": candidates,
+                })),
+                context: None,
             },
         ))
     }
@@ -163,19 +190,44 @@ pub struct SMetricPrefill {
     work: u64,
     started: Instant,
     rates: Option<Arc<Mutex<RateHistory>>>,
+    decision: Option<serde_json::Value>,
+    context: Option<(String, String)>,
 }
 
 impl SMetricPrefill {
+    pub fn record_decision(&mut self, request_id: &str, session_id: &str, turn: &str) {
+        if let Some(mut decision) = self.decision.take() {
+            let worker = decision["selected_worker"].as_str().unwrap_or("").to_owned();
+            decision["request_id"] = request_id.into();
+            decision["session_id"] = session_id.into();
+            decision["turn"] = turn.into();
+            self.context = Some((request_id.to_owned(), worker));
+            eprintln!("SMETRIC_DECISION_JSON {}", decision);
+        }
+    }
+
     pub fn on_first_token(&mut self) {
         let Some(charge) = self.charge.take() else {
             return;
         };
         drop(charge);
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let mut learned_rate = None;
+        let mut samples = 0;
         if let Some(rates) = &self.rates {
-            let elapsed = self.started.elapsed().as_secs_f64();
             if self.work > 0 && elapsed > 0.0 {
-                rates.lock().record(self.work as f64 / elapsed);
+                let mut history = rates.lock();
+                history.record(self.work as f64 / elapsed);
+                learned_rate = history.rate;
+                samples = history.samples.len();
             }
+        }
+        if let Some((request_id, worker)) = &self.context {
+            eprintln!("SMETRIC_RATE_JSON {}", serde_json::json!({
+                "request_id": request_id, "worker": worker, "work": self.work,
+                "elapsed_s": elapsed, "sample_rate": self.work as f64 / elapsed,
+                "learned_rate": learned_rate, "samples": samples,
+            }));
         }
     }
 }
