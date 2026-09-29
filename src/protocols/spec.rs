@@ -565,6 +565,54 @@ impl GenerationRequest for ChatCompletionRequest {
             .unwrap_or_default()
             .to_string()
     }
+    fn extract_text_for_smetric(&self) -> Option<SMetricPrompt> {
+        let mut text = Vec::new();
+        // Stable static metadata precedes messages, so appending a turn preserves prefixes.
+        if let Some(tools) = &self.tools {
+            text.extend_from_slice(b"tools:");
+            serde_json::to_writer(&mut text, tools).ok()?;
+            text.push(b'\n');
+        }
+        if let Some(functions) = &self.functions {
+            text.extend_from_slice(b"functions:");
+            serde_json::to_writer(&mut text, functions).ok()?;
+            text.push(b'\n');
+        }
+        let mut chars = std::str::from_utf8(&text).ok()?.chars().count();
+        let mut est_hit_chars = 0;
+        for message in &self.messages {
+            let content = match message {
+                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                    Some(content)
+                }
+                ChatMessage::Assistant { content, .. } => content.as_ref(),
+                _ => None,
+            };
+            if content.is_some_and(|content| {
+                matches!(content, UserMessageContent::Parts(parts)
+                if parts.iter().any(|part| !matches!(part, ContentPart::Text { .. })))
+            }) {
+                return None; // No text-only approximation for multimodal input.
+            }
+            let start = text.len();
+            serde_json::to_writer(&mut text, message).ok()?;
+            text.push(b'\n');
+            chars += std::str::from_utf8(&text[start..]).ok()?.chars().count();
+            if matches!(message, ChatMessage::Assistant { .. }) {
+                est_hit_chars = chars;
+            }
+        }
+        Some(SMetricPrompt {
+            text: String::from_utf8(text).ok()?,
+            est_hit_chars,
+        })
+    }
+
+    fn passes_smetric_turn_gate(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Assistant { .. }))
+    }
 
     fn extract_text_for_program_scheduling(&self) -> String {
         let mut parts = Vec::new();
@@ -883,6 +931,19 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         self.prompt.extract_text_for_routing()
+    }
+    fn extract_text_for_smetric(&self) -> Option<SMetricPrompt> {
+        match &self.prompt {
+            PromptInput::String(text) => Some(SMetricPrompt {
+                text: text.clone(),
+                est_hit_chars: text.chars().count(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn passes_smetric_turn_gate(&self) -> bool {
+        true // Completion lacks a structured turn boundary; still check cache and TTFT.
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
@@ -2404,6 +2465,12 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Text-only SMetric input with the historical boundary at the last assistant turn.
+pub struct SMetricPrompt {
+    pub text: String,
+    pub est_hit_chars: usize,
+}
+
 /// Common trait for all generation requests across different APIs
 pub trait GenerationRequest: Send + Sync {
     /// Check if the request is for streaming
@@ -2414,6 +2481,14 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+    /// Return a text prompt and historical prefix length; multimodal and token-ID inputs are unsupported.
+    fn extract_text_for_smetric(&self) -> Option<SMetricPrompt> {
+        None
+    }
+
+    fn passes_smetric_turn_gate(&self) -> bool {
+        false
+    }
 
     /// Extract prompt content used only by opted-in Program scheduling.
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -2590,6 +2665,30 @@ mod tests {
         assert_eq!(payload.get("user").unwrap(), "user-a");
         assert!(payload.get("prompt").is_none());
         assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn smetric_chat_history_is_an_append_only_prefix() {
+        let history: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let full: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "next"}
+            ]
+        }))
+        .unwrap();
+        let history_text = history.extract_text_for_smetric().unwrap().text;
+        let prompt = full.extract_text_for_smetric().unwrap();
+        assert!(prompt.text.starts_with(&history_text));
+        assert_eq!(prompt.est_hit_chars, history_text.chars().count());
+        assert!(full.passes_smetric_turn_gate());
     }
     use serde_json;
 

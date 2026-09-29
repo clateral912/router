@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures;
 use serde_json;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
@@ -57,6 +57,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Decrement the load counter
     fn decrement_load(&self);
+    /// Outstanding Router-estimated prefill work, in SMetric cost units.
+    fn pending_prefill_work(&self) -> u64 {
+        0
+    }
+    fn add_prefill_work(&self, _work: u64) {}
+    fn subtract_prefill_work(&self, _work: u64) {}
 
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {
@@ -288,6 +294,7 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     metadata: WorkerMetadata,
     load_counter: Arc<AtomicUsize>,
+    pending_prefill_work: Arc<AtomicU64>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     consecutive_failures: Arc<AtomicUsize>,
@@ -327,6 +334,7 @@ impl BasicWorker {
         Self {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            pending_prefill_work: Arc::new(AtomicU64::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
@@ -487,6 +495,25 @@ impl Worker for BasicWorker {
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
     }
+    fn pending_prefill_work(&self) -> u64 {
+        self.pending_prefill_work.load(Ordering::Acquire)
+    }
+
+    fn add_prefill_work(&self, work: u64) {
+        self.pending_prefill_work
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(work))
+            })
+            .ok();
+    }
+
+    fn subtract_prefill_work(&self, work: u64) {
+        self.pending_prefill_work
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(work))
+            })
+            .ok();
+    }
 }
 
 /// A DP-aware worker that handles data-parallel routing
@@ -559,6 +586,17 @@ impl Worker for DPAwareWorker {
 
     fn load(&self) -> usize {
         self.base_worker.load()
+    }
+    fn pending_prefill_work(&self) -> u64 {
+        self.base_worker.pending_prefill_work()
+    }
+
+    fn add_prefill_work(&self, work: u64) {
+        self.base_worker.add_prefill_work(work);
+    }
+
+    fn subtract_prefill_work(&self, work: u64) {
+        self.base_worker.subtract_prefill_work(work);
     }
 
     fn increment_load(&self) {
@@ -820,6 +858,25 @@ pub fn urls_to_workers(urls: Vec<String>) -> Vec<Box<dyn Worker>> {
 /// Convert worker trait objects back to URLs
 pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
+}
+
+/// Owns exactly one prefill-work charge until the phase finishes or is cancelled.
+pub struct PrefillCharge {
+    worker: Arc<dyn Worker>,
+    work: u64,
+}
+
+impl PrefillCharge {
+    pub fn new(worker: Arc<dyn Worker>, work: u64) -> Self {
+        worker.add_prefill_work(work);
+        Self { worker, work }
+    }
+}
+
+impl Drop for PrefillCharge {
+    fn drop(&mut self) {
+        self.worker.subtract_prefill_work(self.work);
+    }
 }
 
 /// RAII guard for worker load management
