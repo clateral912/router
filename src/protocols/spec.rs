@@ -284,6 +284,45 @@ impl UserMessageContent {
     }
 }
 
+fn tool_content_is_text_only(content: &Value, is_content_part: bool) -> bool {
+    match content {
+        Value::Array(parts) => parts
+            .iter()
+            .all(|part| tool_content_is_text_only(part, is_content_part)),
+        Value::Object(object) => {
+            if let Some(kind) = object.get("type") {
+                if is_content_part
+                    && (kind.as_str() != Some("text")
+                        || !object.get("text").is_some_and(Value::is_string))
+                {
+                    return false;
+                }
+                if matches!(
+                    kind.as_str(),
+                    Some(
+                        "image_url"
+                            | "input_image"
+                            | "input_audio"
+                            | "audio"
+                            | "image"
+                            | "video"
+                            | "video_url"
+                            | "input_video"
+                            | "file"
+                            | "input_file"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            object
+                .iter()
+                .all(|(key, value)| tool_content_is_text_only(value, key == "content"))
+        }
+        _ => true,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
@@ -589,6 +628,11 @@ impl GenerationRequest for ChatCompletionRequest {
                     Some(content)
                 }
                 ChatMessage::Assistant { content, .. } => content.as_ref(),
+                ChatMessage::Tool { content, .. }
+                    if !tool_content_is_text_only(content, content.is_array()) =>
+                {
+                    return None;
+                }
                 _ => None,
             };
             if content.is_some_and(|content| {
@@ -2726,6 +2770,97 @@ mod tests {
         }))
         .unwrap();
         assert!(request.extract_affinity_prompt().is_none());
+    }
+
+    #[test]
+    fn smetric_tool_media_parts_do_not_enable_affinity() {
+        for content in [
+            serde_json::json!([
+                {"type": "text", "text": "tool result"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}
+            ]),
+            serde_json::json!([
+                {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+            ]),
+            serde_json::json!([
+                {"type": "future_media", "payload": "AQID"}
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": content}
+                ]
+            });
+            assert!(
+                affinity_prompt_from_json("/v1/chat/completions", &body).is_none(),
+                "unexpected affinity for {}",
+                body["messages"][1]["content"]
+            );
+            let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["messages"],
+                body["messages"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_nested_media_does_not_enable_affinity() {
+        for content in [
+            serde_json::json!({
+                "type": "image_url", "image_url": {"url": "https://example.com/image.png"}
+            }),
+            serde_json::json!({
+                "result": {"content": [
+                    {"type": "text", "text": "tool result"},
+                    {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+                ]}
+            }),
+            serde_json::json!({
+                "result": {"content": [{"type": "future_media", "payload": "AQID"}]}
+            }),
+            serde_json::json!([
+                [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [{"role": "tool", "tool_call_id": "call_1", "content": content}]
+            });
+            assert!(
+                affinity_prompt_from_json("/v1/chat/completions", &body).is_none(),
+                "unexpected affinity for {}",
+                body["messages"][0]["content"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_text_and_business_json_preserve_affinity() {
+        for content in [
+            serde_json::json!("tool result"),
+            serde_json::json!([{ "type": "text", "text": "tool result" }]),
+            serde_json::json!({
+                "type": "invoice", "total": 21,
+                "items": [{"type": "product", "name": "image_url"}],
+                "image_url": "https://example.com/product.png"
+            }),
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "tool result"}]}}),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": content}
+                ]
+            });
+            let (prompt, cache_affinity) =
+                affinity_prompt_from_json("/v1/chat/completions", &body).unwrap();
+            assert!(cache_affinity);
+            assert_eq!(prompt.est_hit_chars, 53);
+            let tool_message: Value =
+                serde_json::from_str(prompt.text.lines().nth(1).unwrap()).unwrap();
+            assert_eq!(tool_message["content"], body["messages"][1]["content"]);
+        }
     }
 
     use serde_json;
