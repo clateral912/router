@@ -391,8 +391,12 @@ impl CliArgs {
     }
 
     /// Convert policy string to PolicyConfig
-    fn parse_policy(&self, policy_str: &str, smetric: Option<&SMetricConfig>) -> PolicyConfig {
-        match policy_str {
+    fn parse_policy(
+        &self,
+        policy_str: &str,
+        smetric: Option<&SMetricConfig>,
+    ) -> ConfigResult<PolicyConfig> {
+        Ok(match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
@@ -410,10 +414,14 @@ impl CliArgs {
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
             "smetric" => PolicyConfig::SMetric {
-                config: smetric.expect("SMetric YAML must be loaded").clone(),
+                config: smetric
+                    .ok_or_else(|| ConfigError::MissingRequired {
+                        field: "--smetric-config".into(),
+                    })?
+                    .clone(),
             },
             _ => PolicyConfig::RoundRobin, // Fallback
-        }
+        })
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -516,11 +524,13 @@ impl CliArgs {
                 prefill_policy: self
                     .prefill_policy
                     .as_ref()
-                    .map(|p| self.parse_policy(p, smetric.as_ref())),
+                    .map(|p| self.parse_policy(p, smetric.as_ref()))
+                    .transpose()?,
                 decode_policy: self
                     .decode_policy
                     .as_ref()
-                    .map(|p| self.parse_policy(p, smetric.as_ref())),
+                    .map(|p| self.parse_policy(p, smetric.as_ref()))
+                    .transpose()?,
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -537,7 +547,7 @@ impl CliArgs {
         };
 
         // Main policy
-        let policy = self.parse_policy(&self.policy, smetric.as_ref());
+        let policy = self.parse_policy(&self.policy, smetric.as_ref())?;
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -801,6 +811,19 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smetric_policy_without_loaded_config_returns_error() {
+        let args = CliArgs::try_parse_from(["vllm-router"]).unwrap();
+
+        let result = std::panic::catch_unwind(|| args.parse_policy("smetric", None));
+
+        assert!(result.is_ok(), "missing SMetric config must not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(ConfigError::MissingRequired { field }) if field == "--smetric-config"
+        ));
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
