@@ -12,6 +12,7 @@ use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{PolicyRegistry, RequestTracker, RoutingContext};
 use crate::protocols::spec::{affinity_prompt_from_json, GenerationRequest};
+use crate::routers::header_utils::allows_affinity_for_turn;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -76,14 +77,6 @@ const MORIIO_TRANSFER_PREFIX: &str = "tx";
 /// reports success before a discovered prefill/decode pair can serve requests.
 fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
-}
-
-fn allows_affinity_for_turn(headers: Option<&HeaderMap>) -> bool {
-    headers
-        .and_then(|headers| headers.get("x-session-turn"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u32>().ok())
-        .is_none_or(|turn| turn > 1)
 }
 
 /// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.

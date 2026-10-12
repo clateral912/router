@@ -1,3 +1,4 @@
+use super::first_token::{FirstTokenObserver, Observation};
 use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
@@ -92,6 +93,7 @@ struct LoadTrackedBody {
     producer_abort: Option<tokio::task::AbortHandle>,
     tracker: Option<RequestTracker>,
     observe_first_token: bool,
+    first_token: FirstTokenObserver,
 }
 
 impl futures_util::Stream for LoadTrackedBody {
@@ -99,11 +101,19 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.poll_next_unpin(cx);
-        if self.observe_first_token
-            && matches!(&item, Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty())
-        {
-            if let Some(mut tracker) = self.tracker.take() {
-                tracker.on_first_token();
+        if self.observe_first_token && self.tracker.is_some() {
+            if let Poll::Ready(Some(Ok(bytes))) = &item {
+                match self.first_token.observe(bytes) {
+                    Observation::Output => {
+                        if let Some(mut tracker) = self.tracker.take() {
+                            tracker.on_first_token();
+                        }
+                    }
+                    Observation::End => {
+                        self.tracker.take();
+                    }
+                    Observation::Pending => {}
+                }
             }
         }
         if matches!(&item, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
@@ -154,6 +164,7 @@ fn hold_load_until_body_done(
         producer_abort,
         tracker,
         observe_first_token,
+        first_token: FirstTokenObserver::default(),
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -1113,12 +1124,8 @@ impl Router {
             .needs_affinity_prompt()
             .then(|| typed_req.extract_affinity_prompt())
             .flatten();
-        let turn_gate = typed_req.allows_cache_affinity()
-            && headers
-                .and_then(|headers| headers.get("x-session-turn"))
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u32>().ok())
-                .is_none_or(|turn| turn > 1);
+        let turn_gate =
+            typed_req.allows_cache_affinity() && header_utils::allows_affinity_for_turn(headers);
         let text = if policy.needs_affinity_prompt() {
             String::new()
         } else {
@@ -1567,6 +1574,7 @@ impl Router {
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut tracker = tracker;
+                let mut first_token = FirstTokenObserver::default();
                 let mut stream = stream;
                 let mut load = load;
                 let mut first_sse = true;
@@ -1577,9 +1585,17 @@ impl Router {
                 } {
                     match chunk {
                         Ok(bytes) => {
-                            if !bytes.is_empty() {
-                                if let Some(mut tracker) = tracker.take() {
-                                    tracker.on_first_token();
+                            if tracker.is_some() {
+                                match first_token.observe(&bytes) {
+                                    Observation::Output => {
+                                        if let Some(mut tracker) = tracker.take() {
+                                            tracker.on_first_token();
+                                        }
+                                    }
+                                    Observation::End => {
+                                        tracker.take();
+                                    }
+                                    Observation::Pending => {}
                                 }
                             }
                             if first_sse {
@@ -2408,11 +2424,7 @@ impl RouterTrait for Router {
         let context = RoutingContext {
             prompt: affinity.as_ref().map(|(prompt, _)| prompt),
             allow_affinity: affinity.as_ref().is_some_and(|(_, gate)| *gate)
-                && headers
-                    .and_then(|h| h.get("x-session-turn"))
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .is_none_or(|turn| turn > 1),
+                && header_utils::allows_affinity_for_turn(headers),
             colocated: true,
             route: path,
         };
@@ -2873,6 +2885,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_token_observation_ignores_error_and_metadata_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observer {
+            pending: AtomicUsize,
+            samples: AtomicUsize,
+        }
+
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, work: u64) {
+                self.pending.fetch_add(work as usize, Ordering::SeqCst);
+            }
+
+            fn finish(&self, work: u64, elapsed: Option<Duration>) {
+                self.pending.fetch_sub(work as usize, Ordering::SeqCst);
+                if elapsed.is_some() {
+                    self.samples.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        for input in [
+            "data: {\"error\":\"backend failed\"}\n\n",
+            ": router-stages {}\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":0}}\n\ndata: [DONE]\n\n",
+            "data: {\"error\":\"backend failed\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ignored\"}}]}\n\n",
+        ] {
+            let observer = Arc::new(Observer {
+                pending: AtomicUsize::new(0),
+                samples: AtomicUsize::new(0),
+            });
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                "grpc://worker:50051".into(),
+                WorkerType::Regular,
+            ));
+            let response = hold_load_until_body_done(
+                Response::new(Body::from(input)),
+                Some(RequestLoadGuard::new(worker.clone())),
+                Some(RequestTracker::new(observer.clone(), 64)),
+                true,
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(bytes, input);
+            assert_eq!(observer.pending.load(Ordering::SeqCst), 0);
+            assert_eq!(observer.samples.load(Ordering::SeqCst), 0, "{input}");
+            assert_eq!(worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_token_observation_waits_for_complete_output_frame() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observer(AtomicUsize);
+
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, _: u64) {}
+
+            fn finish(&self, _: u64, elapsed: Option<Duration>) {
+                if elapsed.is_some() {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let observer = Arc::new(Observer(AtomicUsize::new(0)));
+        let chunks = [
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"he",
+            "llo\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" again\"}}]}\n\ndata: [DONE]\n\n",
+        ];
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(bytes::Bytes::from_static(chunk.as_bytes()))),
+        );
+        let response = hold_load_until_body_done(
+            Response::new(Body::from_stream(stream)),
+            None,
+            Some(RequestTracker::new(observer.clone(), 64)),
+            true,
+        );
+        let mut body = response.into_body().into_data_stream();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(body.next().await.unwrap().unwrap(), *chunk);
+            assert_eq!(observer.0.load(Ordering::SeqCst), usize::from(index >= 3));
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn grpc_stream_load_follows_producer_and_drop_cancels_it() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "grpc://worker:50051".to_string(),
@@ -3023,6 +3128,41 @@ mod tests {
         let result = Router::headers_to_request_headers(Some(&header_map));
         assert!(result.is_some());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_select_worker_for_model_with_consistent_hash_uses_headers() {
+        let router = create_test_consistent_hash_router();
+        let policy = router.policy_registry.get_default_policy();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("shared-session"));
+        let context = RoutingContext {
+            prompt: None,
+            allow_affinity: false,
+            colocated: true,
+            route: "/v1/completions",
+        };
+        let mut sticky = std::collections::HashSet::new();
+        let mut without_header = std::collections::HashSet::new();
+        for i in 0..64 {
+            let text = format!("unique request content {i}");
+            let (worker, _) = router
+                .select_worker_for_model(
+                    None,
+                    Some(&text),
+                    &context,
+                    Some(&headers),
+                    policy.as_ref(),
+                )
+                .unwrap();
+            sticky.insert(worker.url().to_owned());
+            let (worker, _) = router
+                .select_worker_for_model(None, Some(&text), &context, None, policy.as_ref())
+                .unwrap();
+            without_header.insert(worker.url().to_owned());
+        }
+        assert_eq!(sticky.len(), 1);
+        assert!(without_header.len() > 1);
     }
 
     #[test]
