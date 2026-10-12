@@ -9,6 +9,7 @@ use super::{
     RoundRobinPolicy,
 };
 use crate::config::types::PolicyConfig;
+use crate::core::{Worker, WorkerType};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
@@ -93,6 +94,25 @@ impl PolicyRegistry {
         }
 
         policy
+    }
+
+    pub fn notify_worker_removed(&self, worker: &Arc<dyn Worker>) {
+        let mut policies = vec![self.get_default_policy()];
+        policies.extend(self.get_policy(worker.model_id()));
+        match worker.worker_type() {
+            WorkerType::Prefill { .. } => policies.push(self.get_prefill_policy()),
+            WorkerType::Decode => policies.push(self.get_decode_policy()),
+            _ => {}
+        }
+        for (index, policy) in policies.iter().enumerate() {
+            if !policies[..index]
+                .iter()
+                .any(|previous| Arc::ptr_eq(previous, policy))
+            {
+                policy.on_worker_removed(worker);
+            }
+        }
+        self.on_worker_removed(worker.model_id());
     }
 
     /// Called when a worker is removed

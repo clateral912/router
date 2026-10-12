@@ -650,6 +650,12 @@ pub struct SMetricConfig {
     pub ttft_slo_per_char: f64,
     #[serde(default = "default_smetric_tree_size")]
     pub max_tree_size: usize,
+    #[serde(default = "default_smetric_eviction_interval_secs")]
+    pub eviction_interval_secs: u64,
+}
+
+fn default_smetric_eviction_interval_secs() -> u64 {
+    30
 }
 
 fn default_smetric_tree_size() -> usize {
@@ -696,7 +702,7 @@ pub enum PolicyConfig {
     RendezvousHash,
 
     #[serde(rename = "smetric")]
-    SMetric { config: SMetricConfig },
+    SMetric { config: Box<SMetricConfig> },
 }
 
 impl PolicyConfig {

@@ -232,6 +232,10 @@ vllm-router --policy cache_aware \
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
 
+Transparent proxy requests now contribute to worker load and `running_requests`
+for both `cache_aware` and SMetric, including while a streamed response is open.
+This can affect `cache_aware` balancing for deployments using those endpoints.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
@@ -255,9 +259,11 @@ vllm-router --policy smetric \
 
 The YAML is required; calibrate its character-based cost coefficients, rate and
 TTFT budget for the deployment. Omit `PREFILL_RATE` to learn a per-worker rate
-from first nonempty streamed response chunks or successful PD prefill completion.
+from the first generated output in a stream or successful PD prefill completion.
+Stream metadata and error events do not train the rate estimate.
 An explicit rate stays fixed. `MAX_TREE_SIZE` defaults to 67,108,864 characters
-per worker; size eviction runs every 30 seconds.
+per worker. The optional `EVICTION_INTERVAL_SECS` defaults to 30; set it to `0`
+to disable size eviction. Dropping the policy stops its eviction thread.
 
 Multimodal chat parts, batched/token-ID completion prompts and other endpoints
 fall back to **least-inflight balancing**, with rotating ties among available
@@ -266,8 +272,11 @@ forwarding preserves unsupported content parts; the token-ID-only gRPC path
 still rejects multimodal input.
 Re-encoded PD JSON responses regenerate body-length and framing headers.
 
-Each fallback logs a warning with `route`, input category, `fallback=least_inflight`
-and `selected_worker`, without logging the input payload. SMetric request load
+Each policy instance warns once for each fixed input category: non-text chat,
+batched or token-ID prompts, and unsupported endpoints or missing typed prompts.
+Subsequent fallbacks in the same category log at debug level. Both levels include
+`route`, input category, `fallback=least_inflight` and `selected_worker`, without
+logging the input payload. SMetric request load
 is released on completion, error or cancellation; retry attempts own separate
 load reservations. This does not change Power-of-Two load accounting.
 

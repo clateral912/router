@@ -418,7 +418,8 @@ impl CliArgs {
                     .ok_or_else(|| ConfigError::MissingRequired {
                         field: "--smetric-config".into(),
                     })?
-                    .clone(),
+                    .clone()
+                    .into(),
             },
             _ => PolicyConfig::RoundRobin, // Fallback
         })

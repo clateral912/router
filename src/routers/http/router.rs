@@ -1792,81 +1792,31 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
-        if self.intra_node_data_parallel_size > 1 {
-            // remove dp-aware workers in a prefix-matching fashion
-            // without contacting the remote worker
-            let mut removed_workers: Vec<String> = Vec::new();
-            let worker_url_prefix = format!("{}@", worker_url);
-
-            // Find and remove all workers with matching prefix
-            let all_workers = self.worker_registry.get_all();
-            for w in all_workers.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
-                    let removed_url = w.url().to_string();
-                    // Get model_id before removing
-                    let model_id = w.model_id().to_string();
-
-                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
-                        self.frontend.remove_worker(&removed_url);
-                        info!("Removed worker: {}", removed_url);
-                        removed_workers.push(removed_url);
-
-                        // Notify PolicyRegistry about the removed worker
-                        self.policy_registry.on_worker_removed(&model_id);
-                    } else {
-                        warn!("Worker {} not found, skipping removal", w.url());
-                    }
-                }
-            }
-
-            RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-
-            // If any models are using cache aware policy, remove the workers from the tree
-            // Check each removed worker's model and get its policy
-            for dp_url in removed_workers.iter() {
-                if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
-                    let model_id = worker.model_id();
-                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
-                        if let Some(cache_aware) = policy
-                            .as_any()
-                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            cache_aware.remove_worker_by_url(dp_url);
-                            info!("Removed worker from cache-aware tree: {}", dp_url);
-                        }
-                    }
-                }
-            }
+        let workers = if self.intra_node_data_parallel_size > 1 {
+            let prefix = format!("{}@", worker_url);
+            self.worker_registry
+                .get_all()
+                .into_iter()
+                .filter(|worker| worker.url() == worker_url || worker.url().starts_with(&prefix))
+                .collect::<Vec<_>>()
         } else {
-            // Get the worker first to extract model_id
-            let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                worker.model_id().to_string()
-            } else {
-                warn!("Worker {} not found, skipping removal", worker_url);
-                return;
-            };
-
-            if self.worker_registry.remove_by_url(worker_url).is_some() {
-                self.frontend.remove_worker(worker_url);
-                info!("Removed worker: {}", worker_url);
-
-                // Notify PolicyRegistry about the removed worker
-                self.policy_registry.on_worker_removed(&model_id);
-
-                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-            }
-
-            // If the model is using cache aware policy, remove the worker from the tree
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
-                }
+            self.worker_registry
+                .get_by_url(worker_url)
+                .into_iter()
+                .collect()
+        };
+        if workers.is_empty() {
+            warn!("Worker {} not found, skipping removal", worker_url);
+            return;
+        }
+        for worker in workers {
+            if let Some(removed) = self.worker_registry.remove_by_url(worker.url()) {
+                self.policy_registry.notify_worker_removed(&removed);
+                self.frontend.remove_worker(removed.url());
+                info!("Removed worker: {}", removed.url());
             }
         }
+        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
     }
 
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
@@ -2714,6 +2664,66 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+        }
+    }
+
+    #[test]
+    fn worker_removal_clears_last_model_policy_for_regular_and_dp_workers() {
+        for dp_size in [1, 2] {
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.intra_node_data_parallel_size = dp_size;
+            let base_url = "http://removed:8080";
+            let mut urls = Vec::new();
+            let mut model_policy = None;
+            for rank in 0..dp_size {
+                let url = if dp_size == 1 {
+                    base_url.to_string()
+                } else {
+                    format!("{base_url}@{rank}")
+                };
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_labels(HashMap::from([("model_id".into(), "removed-model".into())])),
+                );
+                router.worker_registry.register(worker);
+                let policy = router
+                    .policy_registry
+                    .on_worker_added("removed-model", Some("cache_aware"));
+                policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    .unwrap()
+                    .commit_placement("removed-model", "shared history", &url);
+                model_policy = Some(policy);
+                urls.push(url);
+            }
+
+            router.remove_worker(base_url);
+
+            assert!(router.worker_registry.get_all().is_empty());
+            assert!(router.policy_registry.get_policy("removed-model").is_none());
+            let policy = model_policy.unwrap();
+            let cache_aware = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                .unwrap();
+            for url in urls {
+                let placement = cache_aware
+                    .evaluate_initial_placement(
+                        "removed-model",
+                        "shared history",
+                        &[crate::policies::CacheAwareCandidate {
+                            target_id: &url,
+                            kv_pressure: 0.0,
+                        }],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    placement.match_rate, 0.0,
+                    "stale cache entry after removing {url}"
+                );
+            }
         }
     }
 

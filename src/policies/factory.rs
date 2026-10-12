@@ -40,7 +40,9 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
-            PolicyConfig::SMetric { config } => Arc::new(SMetricPolicy::new(config.clone())),
+            PolicyConfig::SMetric { config } => {
+                Arc::new(SMetricPolicy::new(config.as_ref().clone()))
+            }
         }
     }
 

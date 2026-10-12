@@ -90,6 +90,8 @@ impl Drop for RequestTracker {
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
+    fn on_worker_removed(&self, _worker: &Arc<dyn Worker>) {}
+
     /// Select a single worker from the available workers
     ///
     /// This is used for regular routing mode where requests go to a single worker.
