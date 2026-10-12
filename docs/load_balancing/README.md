@@ -265,8 +265,9 @@ An explicit rate stays fixed. `MAX_TREE_SIZE` defaults to 67,108,864 characters
 per worker. The optional `EVICTION_INTERVAL_SECS` defaults to 30; set it to `0`
 to disable size eviction. Dropping the policy stops its eviction thread.
 
-Multimodal chat parts, batched/token-ID completion prompts and other endpoints
-fall back to **least-inflight balancing**, with rotating ties among available
+Multimodal chat parts and tool results, unrecognized message roles,
+batched/token-ID completion prompts and other endpoints fall back to
+**least-inflight balancing**, with rotating ties among available
 workers. They do not populate the prefix tree or train prefill rates. Native HTTP
 forwarding preserves unsupported content parts; the token-ID-only gRPC path
 still rejects multimodal input.

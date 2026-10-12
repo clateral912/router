@@ -182,6 +182,7 @@ struct TypedDispatch<'a> {
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    epd: Option<super::epd::EncoderStage>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -384,6 +385,11 @@ impl Router {
         });
 
         Ok(Router {
+            epd: ctx
+                .router_config
+                .epd
+                .clone()
+                .map(super::epd::EncoderStage::new),
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -2327,6 +2333,7 @@ impl RouterTrait for Router {
         body: serde_json::Value,
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
+        let start = Instant::now();
 
         // Select a worker (filter by availability like select_worker_for_model)
         let all_workers = self.worker_registry.get_all();
@@ -2336,6 +2343,7 @@ impl RouterTrait for Router {
             .cloned()
             .collect();
         if workers.is_empty() {
+            RouterMetrics::record_request_error(path, "no_available_workers");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No available workers".to_string(),
@@ -2343,7 +2351,14 @@ impl RouterTrait for Router {
                 .into_response();
         }
 
-        let request_text = serde_json::to_string(&body).ok();
+        let policy = self.policy_registry.get_default_policy();
+        // Serializing the whole body is expensive when it carries base64
+        // media; only consumers that actually read the text pay for it.
+        let request_text = if policy.needs_request_text() || self.program_scheduler.is_some() {
+            serde_json::to_string(&body).ok()
+        } else {
+            None
+        };
         let model_id = body.get("model").and_then(serde_json::Value::as_str);
         let is_stream = body
             .get("stream")
@@ -2361,12 +2376,14 @@ impl RouterTrait for Router {
                 .await
             {
                 Ok(completion) => completion,
-                Err(error) => return Self::schedule_error_response(error),
+                Err(error) => {
+                    RouterMetrics::record_request_error(path, "program_scheduling_error");
+                    return Self::schedule_error_response(error);
+                }
             }
         } else {
             None
         };
-        let policy = self.policy_registry.get_default_policy();
         let affinity = policy
             .needs_affinity_prompt()
             .then(|| affinity_prompt_from_json(path, &body))
@@ -2398,12 +2415,12 @@ impl RouterTrait for Router {
                     }
                 })
         } else {
-            let headers = Self::headers_to_request_headers(headers);
+            let request_headers = Self::headers_to_request_headers(headers);
             policy
                 .select_request(
                     &workers,
                     request_text.as_deref(),
-                    headers.as_ref(),
+                    request_headers.as_ref(),
                     &context,
                 )
                 .map(|(idx, tracker)| (workers[idx].clone(), tracker))
@@ -2412,6 +2429,7 @@ impl RouterTrait for Router {
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
+            RouterMetrics::record_request_error(path, "no_available_workers");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Failed to select the Program target".to_string(),
@@ -2421,6 +2439,31 @@ impl RouterTrait for Router {
         let load = (policy.tracks_load() || program_completion.is_some())
             .then(|| RequestLoadGuard::new(worker.clone()));
         let url = worker.endpoint_url(path);
+
+        let (body, mut transfers) = if let Some(epd) = &self.epd {
+            if *method == Method::POST && path == "/v1/chat/completions" {
+                match epd
+                    .prepare(
+                        &self.client,
+                        body,
+                        worker.url(),
+                        headers,
+                        self.api_key.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        RouterMetrics::record_request_error(path, "encoder_error");
+                        return error.into_response();
+                    }
+                }
+            } else {
+                (body, None)
+            }
+        } else {
+            (body, None)
+        };
 
         debug!("Transparent proxy: forwarding to {}", url);
 
@@ -2433,6 +2476,7 @@ impl RouterTrait for Router {
             Method::PATCH => self.client.patch(&url),
             Method::HEAD => self.client.head(&url),
             _ => {
+                RouterMetrics::record_request_error(path, "unsupported_method");
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
                     format!("Method {} not supported", method),
@@ -2450,6 +2494,29 @@ impl RouterTrait for Router {
         }
 
         // Add authorization if configured
+        if self.epd.is_some() {
+            if let Some(headers) = headers {
+                for (name, value) in headers {
+                    // When a backend api_key is configured it must win:
+                    // RequestBuilder::header appends, and vLLM reads the
+                    // first Authorization value.
+                    if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                        continue;
+                    }
+                    if !matches!(
+                        name.as_str(),
+                        "host"
+                            | "content-length"
+                            | "content-type"
+                            | "connection"
+                            | "transfer-encoding"
+                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                    {
+                        request_builder = request_builder.header(name, value);
+                    }
+                }
+            }
+        }
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
@@ -2469,6 +2536,18 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                // Keep the circuit breaker informed, as the typed path does:
+                // 2xx/4xx count as success, 5xx as worker failure.
+                let was_available = worker.is_available();
+                worker.record_outcome(status.is_success() || status.is_client_error());
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
+                }
+                if status.is_success() {
+                    if let Some(transfers) = transfers.as_mut() {
+                        transfers.disarm();
+                    }
+                }
                 let headers = response.headers().clone();
                 let mut response_builder = Response::builder().status(status.as_u16());
 
@@ -2573,8 +2652,17 @@ impl RouterTrait for Router {
                 }
             }
             Err(error) => {
+                // The 502 response below still flows through
+                // hold_load_until_body_done, which releases the load once
+                // its body finishes or is dropped — do not decrement here.
                 if let Some(completion) = &program_completion {
                     completion.finish(false);
+                }
+                // Transport failure: the worker never produced a response.
+                let was_available = worker.is_available();
+                worker.record_outcome(false);
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
                 }
                 (
                     StatusCode::BAD_GATEWAY,
@@ -2583,6 +2671,12 @@ impl RouterTrait for Router {
                     .into_response()
             }
         };
+        if response.status().is_success() {
+            RouterMetrics::record_request(path);
+            RouterMetrics::record_generate_duration(start.elapsed());
+        } else {
+            RouterMetrics::record_request_error(path, "backend_error");
+        }
         let tracker = if response.status().is_success() {
             tracker
         } else {
@@ -2616,6 +2710,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            epd: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2658,6 +2753,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            epd: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2864,6 +2960,84 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transparent_epd_records_request_metrics() {
+        use axum::{routing::post, Json};
+        use serde_json::{json, Value};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                if body["fail"] == true {
+                    (StatusCode::BAD_REQUEST, "invalid request").into_response()
+                } else if body["stream"] == true {
+                    ([("content-type", "text/event-stream")], "data: [DONE]\n\n").into_response()
+                } else {
+                    Json(json!({"choices": []})).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+        router.worker_registry.register(worker.clone());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 1000,
+            },
+        ));
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        for (body, status, expected_load) in [
+            (json!({"messages": []}), StatusCode::OK, 1),
+            (json!({"messages": [], "stream": true}), StatusCode::OK, 1),
+            (
+                json!({"messages": [], "fail": true}),
+                StatusCode::BAD_REQUEST,
+                1,
+            ),
+            (json!({"messages": null}), StatusCode::BAD_REQUEST, 0),
+        ] {
+            let response = router
+                .route_transparent(None, "/v1/chat/completions", &Method::POST, body)
+                .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(worker.load(), expected_load);
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(worker.load(), 0);
+        }
+        let exported = handle.render();
+        assert!(exported.contains("vllm_router_requests_total{route=\"/v1/chat/completions\"} 2"));
+        assert!(exported.contains("vllm_router_generate_duration_seconds_count 2"));
+        for error in ["encoder_error", "backend_error"] {
+            assert!(
+                exported
+                    .lines()
+                    .any(|line| line.starts_with("vllm_router_request_errors_total{")
+                        && line.contains(&format!("error_type=\"{error}\""))
+                        && line.ends_with(" 1")),
+                "{exported}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -3080,6 +3254,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            epd: None,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
