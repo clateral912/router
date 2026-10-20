@@ -2388,6 +2388,7 @@ impl RouterTrait for VllmPDRouter {
                 allow_affinity: body.allows_cache_affinity() && allows_affinity_for_turn(headers),
                 colocated: false,
                 route: "/v1/chat/completions",
+                kv: None,
             };
             let (prefill_idx, prefill_tracker) = match prefill_policy.select_request(
                 &prefill_workers,
@@ -2571,6 +2572,7 @@ impl RouterTrait for VllmPDRouter {
                 allow_affinity: body.allows_cache_affinity() && allows_affinity_for_turn(headers),
                 colocated: false,
                 route: "/v1/completions",
+                kv: None,
             };
             let (prefill_idx, prefill_tracker) = match prefill_policy.select_request(
                 &prefill_workers,
@@ -2806,6 +2808,7 @@ impl RouterTrait for VllmPDRouter {
                     && allows_affinity_for_turn(headers),
                 colocated: false,
                 route: path,
+                kv: None,
             };
             let (prefill_idx, prefill_tracker) = match prefill_policy.select_request(
                 &prefill_workers,

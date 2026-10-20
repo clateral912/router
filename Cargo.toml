@@ -231,6 +231,10 @@ name = "routing_edge_cases_test"
 path = "tests/rust/routing_edge_cases_test.rs"
 
 [[test]]
+name = "smetric_kv_events"
+path = "tests/rust/smetric_kv_events.rs"
+
+[[test]]
 name = "smetric_routing"
 path = "tests/rust/smetric_routing.rs"
 

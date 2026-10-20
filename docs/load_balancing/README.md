@@ -247,7 +247,7 @@ This can affect `cache_aware` balancing for deployments using those endpoints.
 
 ## SMetric
 
-SMetric balances estimated prefill work and reuses an approximate cached prefix
+SMetric balances estimated prefill work and reuses a cached prefix
 only when the turn/history gate and estimated first-token latency budget allow it.
 It supports text chat, including serialized tool metadata, and single-string
 completion prompts for cache affinity.
@@ -265,6 +265,44 @@ Stream metadata and error events do not train the rate estimate.
 An explicit rate stays fixed. `MAX_TREE_SIZE` defaults to 67,108,864 characters
 per worker. The optional `EVICTION_INTERVAL_SECS` defaults to 30; set it to `0`
 to disable size eviction. Dropping the policy stops its eviction thread.
+
+### Cache state and token input
+
+HTTP workers, including the HTTP P/D path, continue to use the request-history
+Tree. With regular gRPC chat workers, SMetric reuses the shared KV Events
+discovery and index, querying the same prepared token IDs sent to the engine.
+The engine must expose its KV Events configuration through the gRPC Control
+service and publish events. No additional SMetric configuration is needed:
+
+```bash
+vllm-router --policy smetric \
+  --smetric-config examples/configs/smetric.yaml \
+  --worker-urls grpc://worker1:8000 grpc://worker2:8000
+```
+
+An unpinned address needs Control metadata confirming a single DP rank.
+Explicit `@rank` addresses bind to that rank; an ambiguous target receives
+no event-derived credit.
+
+SMetric credits contiguous local GPU blocks in cache group 0, capped at the
+complete blocks before the final prompt token that must be recomputed for
+logits. Host and external cache tiers receive no credit. The index handles
+block removals, cache clears and event sequence gaps; worker removal also
+clears SMetric's binding. Token requests do not populate or consult the Tree.
+Missing metadata or prefix evidence, and requests with a nonempty `cache_salt`,
+receive zero cache credit. LoRA names use the shared index's hash namespace.
+Event interpretation and cache-identity semantics follow the shared upstream index.
+
+The cost model keeps its character units. For a prompt of `L` characters and
+`N` prepared tokens, `H` reusable tokens become `floor(L * H / N)` equivalent
+cached characters. This is a cost approximation based on event-derived token
+residency; it does not recover exact token-to-character offsets. Existing cost
+coefficients, TTFT budgets and rate parameters keep their meaning. Online rate
+learning uses requests with observed event-prefix evidence; zero-match requests
+release their pending work without training the rate, since the shared query
+does not distinguish a cold miss from unavailable cache state. A configured
+`PREFILL_RATE` remains fixed. Tree size and eviction settings apply only to
+the request-history path.
 
 Multimodal chat parts and tool results, unrecognized message roles,
 batched/token-ID completion prompts and other endpoints fall back to
