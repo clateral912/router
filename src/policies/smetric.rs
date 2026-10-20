@@ -1,11 +1,15 @@
 //! SMetric: session cache affinity with a prefill-work fallback.
+use super::{KvEventConsumer, KvRequestContext, TieredMatchProvider};
 use super::{LoadBalancingPolicy, RequestHeaders, RequestObserver, RequestTracker, RoutingContext};
+use crate::kv_index::WorkerKvInfo;
+mod kv;
 use crate::config::SMetricConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::protocols::spec::RoutingPrompt;
 use crate::tree::Tree;
 use dashmap::DashMap;
+use kv::KvResidency;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -17,6 +21,7 @@ use tracing::{debug, warn};
 pub struct SMetricPolicy {
     config: SMetricConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    kv: KvResidency,
     round_robin: AtomicUsize,
     states: DashMap<usize, Arc<WorkerState>>,
     retired: RwLock<HashMap<usize, Weak<dyn Worker>>>,
@@ -64,6 +69,7 @@ impl SMetricPolicy {
         Self {
             config,
             trees,
+            kv: KvResidency::default(),
             states: DashMap::new(),
             retired: RwLock::new(HashMap::new()),
             round_robin: AtomicUsize::new(0),
@@ -79,9 +85,11 @@ impl SMetricPolicy {
         prompt: &RoutingPrompt,
         passes_turn_gate: bool,
         colocated: bool,
+        kv_request: Option<&KvRequestContext<'_>>,
     ) -> Option<(usize, RequestTracker)> {
         let retired = self.retired.read();
         let l = prompt.text.chars().count();
+        let event_hits = kv_request.map(|request| self.kv.prefix_matches(workers, request, l));
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % workers.len().max(1);
         let mut min: Option<(usize, u64, u64)> = None; // index, score, own cost
         let mut prev: Option<(usize, usize, u64, bool)> = None; // index, hit, own cost, TTFT
@@ -92,13 +100,16 @@ impl SMetricPolicy {
             if retired.contains_key(&Self::instance_id(worker)) || !worker.is_available() {
                 continue;
             }
-            let hit = self
-                .trees
-                .get(worker.model_id())
-                .as_ref()
-                .map_or(0, |tree| {
-                    tree.prefix_match_tenant_char_count(&prompt.text, &Self::tenant_key(worker))
-                });
+            let hit = if let Some(hits) = &event_hits {
+                hits[idx].chars
+            } else {
+                self.trees
+                    .get(worker.model_id())
+                    .as_ref()
+                    .map_or(0, |tree| {
+                        tree.prefix_match_tenant_char_count(&prompt.text, &Self::tenant_key(worker))
+                    })
+            };
             let n = (l - hit) as f64;
             let cost = (self.config.c_lin * n + self.config.c_att * n * (l as f64 - n / 2.0)).ceil()
                 as u64;
@@ -139,7 +150,7 @@ impl SMetricPolicy {
         } else {
             (min_idx, min_cost)
         };
-        if !prompt.text.is_empty() {
+        if !prompt.text.is_empty() && event_hits.is_none() {
             self.trees
                 .entry(workers[idx].model_id().to_string())
                 .or_insert_with(|| Arc::new(Tree::new()))
@@ -147,7 +158,13 @@ impl SMetricPolicy {
         }
         RouterMetrics::record_processed_request(workers[idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-        Some((idx, self.track(&workers[idx], cost)))
+        let tracker = self.track(&workers[idx], cost);
+        let tracker = if event_hits.as_ref().is_some_and(|hits| !hits[idx].observed) {
+            tracker.without_rate_sample()
+        } else {
+            tracker
+        };
+        Some((idx, tracker))
     }
 
     fn track(&self, worker: &Arc<dyn Worker>, work: u64) -> RequestTracker {
@@ -266,11 +283,27 @@ impl RequestObserver for WorkerState {
     }
 }
 
+impl KvEventConsumer for SMetricPolicy {
+    fn bind_worker(
+        &self,
+        worker: &dyn Worker,
+        info: &WorkerKvInfo,
+        matches: Option<Arc<dyn TieredMatchProvider>>,
+    ) {
+        let id = worker as *const dyn Worker as *const () as usize;
+        let retired = self.retired.read();
+        if !retired.contains_key(&id) {
+            self.kv.register(id, worker, info, matches);
+        }
+    }
+}
+
 impl LoadBalancingPolicy for SMetricPolicy {
     fn on_worker_removed(&self, worker: &Arc<dyn Worker>) {
         let mut retired = self.retired.write();
         retired.retain(|_, worker| worker.strong_count() > 0);
         retired.insert(Self::instance_id(worker), Arc::downgrade(worker));
+        self.kv.remove(Self::instance_id(worker));
         self.states.remove(&Self::instance_id(worker));
         self.trees.remove_if(worker.model_id(), |_, tree| {
             tree.remove_tenant(&Self::tenant_key(worker));
@@ -295,8 +328,14 @@ impl LoadBalancingPolicy for SMetricPolicy {
         context: &RoutingContext<'_>,
     ) -> Option<(usize, Option<RequestTracker>)> {
         if let Some(prompt) = context.prompt {
-            self.select_prefill(workers, prompt, context.allow_affinity, context.colocated)
-                .map(|(idx, tracker)| (idx, Some(tracker)))
+            self.select_prefill(
+                workers,
+                prompt,
+                context.allow_affinity,
+                context.colocated,
+                context.kv.as_ref(),
+            )
+            .map(|(idx, tracker)| (idx, Some(tracker)))
         } else {
             self.balance(workers, context.route).map(|idx| (idx, None))
         }
@@ -369,6 +408,7 @@ mod tests {
                     allow_affinity: false,
                     colocated: false,
                     route,
+                    kv: None,
                 };
                 assert_eq!(
                     policy
@@ -514,7 +554,8 @@ mod tests {
                 std::slice::from_ref(&worker),
                 &prompt("stale request", 0),
                 false,
-                false
+                false,
+                None
             )
             .is_none());
         assert!(policy.states.is_empty());
@@ -739,7 +780,7 @@ mod tests {
         colocated: bool,
     ) -> (usize, RequestTracker) {
         policy
-            .select_prefill(workers, prompt, turn_gate, colocated)
+            .select_prefill(workers, prompt, turn_gate, colocated, None)
             .unwrap()
     }
 
@@ -1032,6 +1073,7 @@ mod tests {
             allow_affinity: false,
             colocated: true,
             route: "/v1/embeddings",
+            kv: None,
         };
         assert_eq!(
             policy

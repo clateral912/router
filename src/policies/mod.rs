@@ -27,10 +27,10 @@ pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
-    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
-    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
-    TemperaturePicker, TieredMatchProvider, TransferCredits,
+    cost_components, kv_aware_ops, kv_event_consumer, CandidateView, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvEventConsumer, KvRequestSlot,
+    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
+    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
@@ -43,10 +43,18 @@ pub use smetric::SMetricPolicy;
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct KvRequestContext<'a> {
+    pub token_ids: &'a [u32],
+    pub lora_name: Option<&'a str>,
+    pub cache_salt: Option<&'a str>,
+}
+
 /// Optional request metadata for affinity-aware selection.
 #[derive(Clone, Default)]
 pub struct RoutingContext<'a> {
     pub prompt: Option<&'a RoutingPrompt>,
+    pub kv: Option<KvRequestContext<'a>>,
     pub allow_affinity: bool,
     pub colocated: bool,
     pub route: &'a str,
@@ -64,6 +72,7 @@ pub struct RequestTracker {
     observer: Option<Arc<dyn RequestObserver>>,
     work: u64,
     started: Instant,
+    sample_rate: bool,
 }
 
 impl RequestTracker {
@@ -73,11 +82,17 @@ impl RequestTracker {
             observer: Some(observer),
             work,
             started: Instant::now(),
+            sample_rate: true,
         }
     }
 
+    pub(crate) fn without_rate_sample(mut self) -> Self {
+        self.sample_rate = false;
+        self
+    }
+
     pub fn on_first_token(&mut self) {
-        self.finish(Some(self.started.elapsed()));
+        self.finish(self.sample_rate.then(|| self.started.elapsed()));
     }
 
     fn finish(&mut self, elapsed: Option<Duration>) {
