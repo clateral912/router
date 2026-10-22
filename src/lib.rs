@@ -140,6 +140,7 @@ impl Router {
                     kv_penalty_host: self.kv_penalty_host,
                     kv_penalty_external: self.kv_penalty_external,
                     kv_penalty_disk: self.kv_penalty_disk,
+                    smetric: None,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value

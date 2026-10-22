@@ -14,8 +14,8 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `smetric` | Text-based agent workloads with a TTFT budget | Yes (conditional cache affinity) | Yes |
-| `kv_aware` | Tiered KV reuse and live-load scoring | No | Yes |
+| `smetric` (alias of KV-aware SMetric selection) | Text-based agent workloads with a TTFT budget | Yes (conditional cache affinity) | Yes |
+| `kv_aware` | Tiered KV reuse and live-load scoring; optional SMetric TTFT gate | Conditional in SMetric mode | Yes |
 
 ---
 
@@ -245,20 +245,33 @@ This can affect `cache_aware` balancing for deployments using those endpoints.
 
 ---
 
-## SMetric
+## SMetric selection
 
-SMetric balances estimated prefill work and reuses a cached prefix
+SMetric is an optional selection mode of `KvAwarePolicy`. It balances estimated prefill work and reuses a cached prefix
 only when the turn/history gate and estimated first-token latency budget allow it.
 It supports text chat, including serialized tool metadata, and single-string
 completion prompts for cache affinity.
 
 ```bash
-vllm-router --policy smetric \
+vllm-router --policy kv_aware \
   --smetric-config examples/configs/smetric.yaml \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
-The YAML is required; calibrate its character-based cost coefficients, rate and
+`--smetric-config` selects SMetric within `kv_aware`; without it, the existing
+multiplicative scorer and picker remain the default. `--policy smetric` remains
+a compatibility alias for the same implementation. YAML router configuration
+can select this mode with `policy: {type: kv_aware, smetric: {...}}`.
+
+Worker binding, event queries and candidate collection are shared by both modes.
+SMetric retains its character-cost and rate history because these quantities
+are different from the default mode's token counters. Its `RequestTracker`
+uses the same router request-lifecycle guard; it does not add a second token
+slot reservation. HTTP and P/D prefill retain the existing Tree behavior.
+Temperature and non-device transfer-credit options apply to the default mode;
+SMetric uses its deterministic affinity/budget rule and local GPU prefix credit.
+
+The YAML is required to select SMetric; calibrate its character-based cost coefficients, rate and
 TTFT budget for the deployment. Omit `PREFILL_RATE` to learn a per-worker rate
 from the first generated output in a stream or successful PD prefill completion.
 Stream metadata and error events do not train the rate estimate.
@@ -275,7 +288,7 @@ The engine must expose its KV Events configuration through the gRPC Control
 service and publish events. No additional SMetric configuration is needed:
 
 ```bash
-vllm-router --policy smetric \
+vllm-router --policy kv_aware \
   --smetric-config examples/configs/smetric.yaml \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
@@ -330,7 +343,7 @@ archived figures are unchanged.
 
 ## KV Aware
 
-The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. It is supported in regular, co-located routing mode only; it is not supported with PD disaggregation. In PD mode, the effective prefill and decode policies must use other policies. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the policy degrades to load-only scoring and does not use KV event placement.
+The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. The default multiplicative selection is supported in regular, co-located routing mode only. In PD mode, prefill may use the SMetric selection described above; decode must use another supported policy. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the default selection uses load-only scoring, while SMetric selection uses the request-history Tree.
 
 ```bash
 vllm-router --policy kv_aware \

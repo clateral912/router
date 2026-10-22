@@ -1,6 +1,5 @@
 //! Factory for creating load balancing policies
 
-use super::SMetricPolicy;
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAwarePolicy,
     LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
@@ -40,16 +39,23 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
-            } => Arc::new(KvAwarePolicy::new(CostParams {
-                router_temperature: *router_temperature,
-                transfer_credits: TransferCredits {
-                    device: 1.0,
-                    host_pinned: *kv_penalty_host,
-                    external: *kv_penalty_external,
-                    disk: *kv_penalty_disk,
-                },
-                ..CostParams::default()
-            })),
+                smetric,
+            } => {
+                let policy = KvAwarePolicy::new(CostParams {
+                    router_temperature: *router_temperature,
+                    transfer_credits: TransferCredits {
+                        device: 1.0,
+                        host_pinned: *kv_penalty_host,
+                        external: *kv_penalty_external,
+                        disk: *kv_penalty_disk,
+                    },
+                    ..CostParams::default()
+                });
+                Arc::new(match smetric {
+                    Some(config) => policy.with_smetric(config.as_ref().clone()),
+                    None => policy,
+                })
+            }
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
                 // Note: virtual_nodes parameter is available but not currently used
                 // The consistent hash policy uses a hardcoded value for now
@@ -57,7 +63,7 @@ impl PolicyFactory {
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
             PolicyConfig::SMetric { config } => {
-                Arc::new(SMetricPolicy::new(config.as_ref().clone()))
+                Arc::new(KvAwarePolicy::default().with_smetric(config.as_ref().clone()))
             }
         }
     }
@@ -112,6 +118,7 @@ mod tests {
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
+            smetric: None,
         });
         assert_eq!(policy.name(), "kv_aware");
 

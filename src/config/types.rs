@@ -712,6 +712,8 @@ pub enum PolicyConfig {
         kv_penalty_external: f64,
         #[serde(default = "default_kv_penalty_disk")]
         kv_penalty_disk: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        smetric: Option<Box<SMetricConfig>>,
     },
 
     #[serde(rename = "power_of_two")]
@@ -734,6 +736,14 @@ pub enum PolicyConfig {
 }
 
 impl PolicyConfig {
+    pub fn smetric_config(&self) -> Option<&SMetricConfig> {
+        match self {
+            Self::SMetric { config } => Some(config),
+            Self::KvAware { smetric, .. } => smetric.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",

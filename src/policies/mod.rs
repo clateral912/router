@@ -27,17 +27,16 @@ pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, kv_event_consumer, CandidateView, CostComponents, CostDecision,
-    CostParams, InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvEventConsumer, KvRequestSlot,
-    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
-    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
+    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
+    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
+    TemperaturePicker, TieredMatchProvider, TransferCredits,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
-pub use smetric::SMetricPolicy;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value

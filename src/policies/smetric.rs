@@ -1,15 +1,13 @@
 //! SMetric: session cache affinity with a prefill-work fallback.
-use super::{KvEventConsumer, KvRequestContext, TieredMatchProvider};
-use super::{LoadBalancingPolicy, RequestHeaders, RequestObserver, RequestTracker, RoutingContext};
-use crate::kv_index::WorkerKvInfo;
-mod kv;
+use super::{RequestObserver, RequestTracker, RoutingContext};
+pub(super) mod kv;
 use crate::config::SMetricConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::protocols::spec::RoutingPrompt;
 use crate::tree::Tree;
 use dashmap::DashMap;
-use kv::KvResidency;
+use kv::PrefixMatch;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -18,10 +16,9 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 #[derive(Debug)]
-pub struct SMetricPolicy {
+pub(super) struct SMetricStrategy {
     config: SMetricConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
-    kv: KvResidency,
     round_robin: AtomicUsize,
     states: DashMap<usize, Arc<WorkerState>>,
     retired: RwLock<HashMap<usize, Weak<dyn Worker>>>,
@@ -30,7 +27,7 @@ pub struct SMetricPolicy {
     eviction_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl SMetricPolicy {
+impl SMetricStrategy {
     fn instance_id(worker: &Arc<dyn Worker>) -> usize {
         Arc::as_ptr(worker) as *const () as usize
     }
@@ -69,7 +66,6 @@ impl SMetricPolicy {
         Self {
             config,
             trees,
-            kv: KvResidency::default(),
             states: DashMap::new(),
             retired: RwLock::new(HashMap::new()),
             round_robin: AtomicUsize::new(0),
@@ -85,14 +81,14 @@ impl SMetricPolicy {
         prompt: &RoutingPrompt,
         passes_turn_gate: bool,
         colocated: bool,
-        kv_request: Option<&KvRequestContext<'_>>,
-    ) -> Option<(usize, RequestTracker)> {
+        event_hits: Option<&[PrefixMatch]>,
+        loads: Option<&[usize]>,
+    ) -> Option<(usize, RequestTracker, u64)> {
         let retired = self.retired.read();
         let l = prompt.text.chars().count();
-        let event_hits = kv_request.map(|request| self.kv.prefix_matches(workers, request, l));
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % workers.len().max(1);
         let mut min: Option<(usize, u64, u64)> = None; // index, score, own cost
-        let mut prev: Option<(usize, usize, u64, bool)> = None; // index, hit, own cost, TTFT
+        let mut prev: Option<(usize, usize, u64, bool, u64)> = None; // index, hit, own cost, TTFT
         let mut any_meets_ttft = false;
         for offset in 0..workers.len() {
             let idx = (start + offset) % workers.len();
@@ -129,26 +125,27 @@ impl SMetricPolicy {
             });
             any_meets_ttft |= meets;
             let score = if colocated {
-                queued.saturating_mul(worker.load() as u64)
+                queued
+                    .saturating_mul(loads.map_or_else(|| worker.load(), |loads| loads[idx]) as u64)
             } else {
                 queued
             };
             if min.is_none_or(|(_, best, _)| score < best) {
                 min = Some((idx, score, cost));
             }
-            if prev.is_none_or(|(_, best, _, _)| hit > best) {
-                prev = Some((idx, hit, cost, meets));
+            if prev.is_none_or(|(_, best, _, _, _)| hit > best) {
+                prev = Some((idx, hit, cost, meets, score));
             }
         }
-        let (prev_idx, hit, prev_cost, prev_meets) = prev?;
-        let (min_idx, _, min_cost) = min?;
-        let (idx, cost) = if passes_turn_gate
+        let (prev_idx, hit, prev_cost, prev_meets, prev_score) = prev?;
+        let (min_idx, min_score, min_cost) = min?;
+        let (idx, cost, score) = if passes_turn_gate
             && (hit as f64) > self.config.hit_ratio * prompt.est_hit_chars as f64
             && (prev_meets || !any_meets_ttft)
         {
-            (prev_idx, prev_cost)
+            (prev_idx, prev_cost, prev_score)
         } else {
-            (min_idx, min_cost)
+            (min_idx, min_cost, min_score)
         };
         if !prompt.text.is_empty() && event_hits.is_none() {
             self.trees
@@ -157,14 +154,14 @@ impl SMetricPolicy {
                 .insert(&prompt.text, &Self::tenant_key(&workers[idx]));
         }
         RouterMetrics::record_processed_request(workers[idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+        RouterMetrics::record_policy_decision("kv_aware", workers[idx].url());
         let tracker = self.track(&workers[idx], cost);
         let tracker = if event_hits.as_ref().is_some_and(|hits| !hits[idx].observed) {
             tracker.without_rate_sample()
         } else {
             tracker
         };
-        Some((idx, tracker))
+        Some((idx, tracker, score))
     }
 
     fn track(&self, worker: &Arc<dyn Worker>, work: u64) -> RequestTracker {
@@ -211,12 +208,12 @@ impl SMetricPolicy {
                 "SMetric does not support this input; falling back to least-inflight balancing (cache affinity disabled)");
         }
         RouterMetrics::record_processed_request(workers[idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+        RouterMetrics::record_policy_decision("kv_aware", workers[idx].url());
         Some(idx)
     }
 }
 
-impl Drop for SMetricPolicy {
+impl Drop for SMetricStrategy {
     fn drop(&mut self) {
         if let Some(shutdown) = self.eviction_shutdown.take() {
             let _ = shutdown.send(());
@@ -283,27 +280,11 @@ impl RequestObserver for WorkerState {
     }
 }
 
-impl KvEventConsumer for SMetricPolicy {
-    fn bind_worker(
-        &self,
-        worker: &dyn Worker,
-        info: &WorkerKvInfo,
-        matches: Option<Arc<dyn TieredMatchProvider>>,
-    ) {
-        let id = worker as *const dyn Worker as *const () as usize;
-        let retired = self.retired.read();
-        if !retired.contains_key(&id) {
-            self.kv.register(id, worker, info, matches);
-        }
-    }
-}
-
-impl LoadBalancingPolicy for SMetricPolicy {
-    fn on_worker_removed(&self, worker: &Arc<dyn Worker>) {
+impl SMetricStrategy {
+    pub(super) fn on_worker_removed(&self, worker: &Arc<dyn Worker>) {
         let mut retired = self.retired.write();
         retired.retain(|_, worker| worker.strong_count() > 0);
         retired.insert(Self::instance_id(worker), Arc::downgrade(worker));
-        self.kv.remove(Self::instance_id(worker));
         self.states.remove(&Self::instance_id(worker));
         self.trees.remove_if(worker.model_id(), |_, tree| {
             tree.remove_tenant(&Self::tenant_key(worker));
@@ -311,49 +292,41 @@ impl LoadBalancingPolicy for SMetricPolicy {
         });
     }
 
-    fn select_worker_with_headers(
+    pub(super) fn with_active_worker<T>(
         &self,
-        workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
-    ) -> Option<usize> {
-        self.balance(workers, "<generic-policy-call>")
+        worker: &dyn Worker,
+        bind: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let id = worker as *const dyn Worker as *const () as usize;
+        let retired = self.retired.read();
+        if retired.contains_key(&id) {
+            None
+        } else {
+            Some(bind())
+        }
     }
 
-    fn select_request(
+    pub(super) fn select_request(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
         context: &RoutingContext<'_>,
-    ) -> Option<(usize, Option<RequestTracker>)> {
+        hits: Option<&[PrefixMatch]>,
+        loads: Option<&[usize]>,
+    ) -> Option<(usize, Option<RequestTracker>, u64)> {
         if let Some(prompt) = context.prompt {
             self.select_prefill(
                 workers,
                 prompt,
                 context.allow_affinity,
                 context.colocated,
-                context.kv.as_ref(),
+                hits,
+                loads,
             )
-            .map(|(idx, tracker)| (idx, Some(tracker)))
+            .map(|(idx, tracker, score)| (idx, Some(tracker), score))
         } else {
-            self.balance(workers, context.route).map(|idx| (idx, None))
+            self.balance(workers, context.route)
+                .map(|idx| (idx, None, workers[idx].load() as u64))
         }
-    }
-
-    fn needs_affinity_prompt(&self) -> bool {
-        true
-    }
-
-    fn tracks_load(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &'static str {
-        "smetric"
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -361,6 +334,38 @@ impl LoadBalancingPolicy for SMetricPolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+
+    #[test]
+    fn unobserved_event_work_is_released_without_training_the_rate() {
+        let policy = SMetricStrategy::new(serde_yaml::from_str("C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n").unwrap());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:1".into(),
+            WorkerType::Regular,
+        ));
+        let prompt = RoutingPrompt {
+            text: "abcdefghijklm".into(),
+            est_hit_chars: 0,
+        };
+        let (_, mut tracker, _) = policy
+            .select_prefill(
+                std::slice::from_ref(&worker),
+                &prompt,
+                true,
+                true,
+                Some(&[PrefixMatch::default()]),
+                None,
+            )
+            .unwrap();
+        let state = policy
+            .states
+            .get(&SMetricStrategy::instance_id(&worker))
+            .unwrap()
+            .clone();
+        assert_eq!(state.pending.load(Ordering::Acquire), 13);
+        tracker.on_first_token();
+        assert_eq!(state.pending.load(Ordering::Acquire), 0);
+        assert!(state.rates.lock().samples.is_empty());
+    }
 
     #[derive(Clone)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
@@ -412,7 +417,7 @@ mod tests {
                 };
                 assert_eq!(
                     policy
-                        .select_request(&workers, Some("private fallback payload"), None, &context)
+                        .select_request(&workers, &context, None, None)
                         .unwrap()
                         .0,
                     0
@@ -466,10 +471,10 @@ mod tests {
     #[test]
     fn configured_eviction_expires_cache_while_zero_preserves_it() {
         let yaml = "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nMAX_TREE_SIZE: 1\n";
-        let enabled = SMetricPolicy::new(
+        let enabled = SMetricStrategy::new(
             serde_yaml::from_str(&format!("{yaml}EVICTION_INTERVAL_SECS: 1\n")).unwrap(),
         );
-        let disabled = SMetricPolicy::new(
+        let disabled = SMetricStrategy::new(
             serde_yaml::from_str(&format!("{yaml}EVICTION_INTERVAL_SECS: 0\n")).unwrap(),
         );
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
@@ -488,7 +493,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
         let enabled_tree = enabled.trees.get(worker.model_id()).unwrap().clone();
         while enabled_tree
-            .prefix_match_tenant_char_count("cached history", &SMetricPolicy::tenant_key(&worker))
+            .prefix_match_tenant_char_count("cached history", &SMetricStrategy::tenant_key(&worker))
             != 0
             && std::time::Instant::now() < deadline
         {
@@ -497,7 +502,7 @@ mod tests {
         assert_eq!(
             enabled_tree.prefix_match_tenant_char_count(
                 "cached history",
-                &SMetricPolicy::tenant_key(&worker)
+                &SMetricStrategy::tenant_key(&worker)
             ),
             0
         );
@@ -508,7 +513,7 @@ mod tests {
                 .unwrap()
                 .prefix_match_tenant_char_count(
                     "cached history",
-                    &SMetricPolicy::tenant_key(&worker)
+                    &SMetricStrategy::tenant_key(&worker)
                 ),
             14
         );
@@ -533,8 +538,8 @@ mod tests {
         handle.join().unwrap();
     }
 
-    fn removal_test_policy() -> SMetricPolicy {
-        SMetricPolicy::new(serde_yaml::from_str(
+    fn removal_test_policy() -> SMetricStrategy {
+        SMetricStrategy::new(serde_yaml::from_str(
             "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\n",
         ).unwrap())
     }
@@ -555,6 +560,7 @@ mod tests {
                 &prompt("stale request", 0),
                 false,
                 false,
+                None,
                 None
             )
             .is_none());
@@ -608,10 +614,10 @@ mod tests {
 
         assert!(policy
             .states
-            .contains_key(&SMetricPolicy::instance_id(&replacement)));
+            .contains_key(&SMetricStrategy::instance_id(&replacement)));
         let replacement_state = policy
             .states
-            .get(&SMetricPolicy::instance_id(&replacement))
+            .get(&SMetricStrategy::instance_id(&replacement))
             .unwrap()
             .clone();
         assert_eq!(replacement_state.pending.load(Ordering::Acquire), 11);
@@ -622,7 +628,7 @@ mod tests {
                 .unwrap()
                 .prefix_match_tenant_char_count(
                     "new history",
-                    &SMetricPolicy::tenant_key(&replacement)
+                    &SMetricStrategy::tenant_key(&replacement)
                 ),
             11
         );
@@ -688,25 +694,25 @@ mod tests {
 
         assert!(!policy
             .states
-            .contains_key(&SMetricPolicy::instance_id(&first)));
+            .contains_key(&SMetricStrategy::instance_id(&first)));
         assert!(policy
             .states
-            .contains_key(&SMetricPolicy::instance_id(&second)));
+            .contains_key(&SMetricStrategy::instance_id(&second)));
         let tree = policy.trees.get(first.model_id()).unwrap();
         assert_eq!(
             tree.prefix_match_tenant_char_count(
                 "first history",
-                &SMetricPolicy::tenant_key(&first)
+                &SMetricStrategy::tenant_key(&first)
             ),
             0
         );
         assert!(!tree
             .tenant_char_count
-            .contains_key(SMetricPolicy::tenant_key(&first).as_str()));
+            .contains_key(SMetricStrategy::tenant_key(&first).as_str()));
         assert_eq!(
             tree.prefix_match_tenant_char_count(
                 "second history",
-                &SMetricPolicy::tenant_key(&second)
+                &SMetricStrategy::tenant_key(&second)
             ),
             14
         );
@@ -734,7 +740,7 @@ mod tests {
         );
         let old_state = policy
             .states
-            .get(&SMetricPolicy::instance_id(&worker))
+            .get(&SMetricStrategy::instance_id(&worker))
             .unwrap()
             .clone();
 
@@ -750,7 +756,7 @@ mod tests {
         );
         let replacement_state = policy
             .states
-            .get(&SMetricPolicy::instance_id(&replacement))
+            .get(&SMetricStrategy::instance_id(&replacement))
             .unwrap()
             .clone();
 
@@ -773,14 +779,15 @@ mod tests {
     }
 
     fn select(
-        policy: &SMetricPolicy,
+        policy: &SMetricStrategy,
         workers: &[Arc<dyn Worker>],
         prompt: &RoutingPrompt,
         turn_gate: bool,
         colocated: bool,
     ) -> (usize, RequestTracker) {
         policy
-            .select_prefill(workers, prompt, turn_gate, colocated, None)
+            .select_prefill(workers, prompt, turn_gate, colocated, None, None)
+            .map(|(index, tracker, _)| (index, tracker))
             .unwrap()
     }
 
@@ -797,7 +804,7 @@ mod tests {
             max_tree_size: 1000,
             eviction_interval_secs: 30,
         };
-        let policy = SMetricPolicy::new(config);
+        let policy = SMetricStrategy::new(config);
         let workers: Vec<Arc<dyn Worker>> = ["http://one", "http://two"]
             .into_iter()
             .map(|url| {
@@ -831,7 +838,7 @@ mod tests {
         assert_eq!(
             policy
                 .states
-                .get(&SMetricPolicy::instance_id(&workers[0]))
+                .get(&SMetricStrategy::instance_id(&workers[0]))
                 .unwrap()
                 .pending
                 .load(Ordering::Acquire),
@@ -840,7 +847,7 @@ mod tests {
         assert_eq!(
             policy
                 .states
-                .get(&SMetricPolicy::instance_id(&workers[1]))
+                .get(&SMetricStrategy::instance_id(&workers[1]))
                 .unwrap()
                 .pending
                 .load(Ordering::Acquire),
@@ -874,7 +881,7 @@ mod tests {
         let prompt = prompt("first turn", 0);
         assert_eq!(
             select(
-                &SMetricPolicy::new(config.clone()),
+                &SMetricStrategy::new(config.clone()),
                 &workers,
                 &prompt,
                 false,
@@ -884,7 +891,14 @@ mod tests {
             1
         );
         assert_eq!(
-            select(&SMetricPolicy::new(config), &workers, &prompt, false, false).0,
+            select(
+                &SMetricStrategy::new(config),
+                &workers,
+                &prompt,
+                false,
+                false
+            )
+            .0,
             0
         );
     }
@@ -908,7 +922,7 @@ mod tests {
                 Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
             })
             .collect();
-        let dynamic = SMetricPolicy::new(config.clone());
+        let dynamic = SMetricStrategy::new(config.clone());
         assert_eq!(
             select(&dynamic, &workers, &prompt("shared", 0), false, false).0,
             0
@@ -918,7 +932,7 @@ mod tests {
         assert_eq!(select(&dynamic, &workers, &follow_up, true, false).0, 0);
         let rate_history = dynamic
             .states
-            .get(&SMetricPolicy::instance_id(&workers[0]))
+            .get(&SMetricStrategy::instance_id(&workers[0]))
             .unwrap();
         for _ in 0..RATE_MIN_SAMPLES {
             rate_history.rates.lock().record(1.0);
@@ -927,7 +941,7 @@ mod tests {
         assert_eq!(select(&dynamic, &workers, &follow_up, true, false).0, 1);
         drop(queued);
 
-        let fixed = SMetricPolicy::new(SMetricConfig {
+        let fixed = SMetricStrategy::new(SMetricConfig {
             prefill_rate: Some(1000.0),
             ..config
         });
@@ -939,7 +953,7 @@ mod tests {
         // The configured rate remains authoritative even if observed rates exist.
         fixed
             .states
-            .get(&SMetricPolicy::instance_id(&workers[0]))
+            .get(&SMetricStrategy::instance_id(&workers[0]))
             .unwrap()
             .rates
             .lock()
@@ -964,7 +978,7 @@ mod tests {
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorker::new("http://one".into(), WorkerType::Regular));
         let workers = vec![worker.clone()];
-        let learned = SMetricPolicy::new(config.clone());
+        let learned = SMetricStrategy::new(config.clone());
         for i in 0..RATE_MIN_SAMPLES {
             let sample = prompt(&format!("prefill-{i}"), 0);
             let other = learned.track(&worker, 13);
@@ -972,7 +986,7 @@ mod tests {
             assert!(
                 learned
                     .states
-                    .get(&SMetricPolicy::instance_id(&worker))
+                    .get(&SMetricStrategy::instance_id(&worker))
                     .unwrap()
                     .pending
                     .load(Ordering::Acquire)
@@ -983,7 +997,7 @@ mod tests {
             assert_eq!(
                 learned
                     .states
-                    .get(&SMetricPolicy::instance_id(&worker))
+                    .get(&SMetricStrategy::instance_id(&worker))
                     .unwrap()
                     .pending
                     .load(Ordering::Acquire),
@@ -993,7 +1007,7 @@ mod tests {
             assert_eq!(
                 learned
                     .states
-                    .get(&SMetricPolicy::instance_id(&worker))
+                    .get(&SMetricStrategy::instance_id(&worker))
                     .unwrap()
                     .pending
                     .load(Ordering::Acquire),
@@ -1002,7 +1016,7 @@ mod tests {
             assert_eq!(
                 learned
                     .states
-                    .get(&SMetricPolicy::instance_id(&worker))
+                    .get(&SMetricStrategy::instance_id(&worker))
                     .unwrap()
                     .rates
                     .lock()
@@ -1012,7 +1026,7 @@ mod tests {
             );
         }
 
-        let fixed = SMetricPolicy::new(SMetricConfig {
+        let fixed = SMetricStrategy::new(SMetricConfig {
             prefill_rate: Some(1000.0),
             ..config
         });
@@ -1021,7 +1035,7 @@ mod tests {
         assert_eq!(
             fixed
                 .states
-                .get(&SMetricPolicy::instance_id(&worker))
+                .get(&SMetricStrategy::instance_id(&worker))
                 .unwrap()
                 .pending
                 .load(Ordering::Acquire),
@@ -1039,7 +1053,7 @@ mod tests {
         assert_eq!(
             learned
                 .states
-                .get(&SMetricPolicy::instance_id(&worker))
+                .get(&SMetricStrategy::instance_id(&worker))
                 .unwrap()
                 .pending
                 .load(Ordering::Acquire),
@@ -1049,7 +1063,7 @@ mod tests {
 
     #[test]
     fn fallback_balances_without_seeding_affinity_and_skips_unavailable_workers() {
-        let policy = SMetricPolicy::new(SMetricConfig {
+        let policy = SMetricStrategy::new(SMetricConfig {
             c_lin: 1.0,
             c_att: 0.0,
             prefill_rate: Some(1000.0),
@@ -1077,7 +1091,7 @@ mod tests {
         };
         assert_eq!(
             policy
-                .select_request(&workers, Some("fresh"), None, &context)
+                .select_request(&workers, &context, None, None)
                 .unwrap()
                 .0,
             1
@@ -1090,14 +1104,14 @@ mod tests {
         );
         assert_eq!(
             (
-                policy.select_worker(&workers, None),
-                policy.select_worker(&workers, None)
+                policy.balance(&workers, "<generic-policy-call>"),
+                policy.balance(&workers, "<generic-policy-call>")
             ),
             (Some(1), Some(0))
         );
         workers[1].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
+        assert_eq!(policy.balance(&workers, "<generic-policy-call>"), Some(0));
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None), None);
+        assert_eq!(policy.balance(&workers, "<generic-policy-call>"), None);
     }
 }

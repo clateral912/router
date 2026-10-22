@@ -9,8 +9,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, kv_event_consumer, KvRequestContext, KvRequestSlot, KvSelectionReceipt,
-    LoadBalancingPolicy, PolicyRegistry, RequestTracker, RoutingContext,
+    kv_aware_ops, KvRequestContext, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
+    PolicyRegistry, RequestTracker, RoutingContext,
 };
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
@@ -411,7 +411,7 @@ impl Router {
         };
         let default_policy = ctx.policy_registry.get_default_policy();
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) = if kv_event_consumer(default_policy.as_ref())
+        let (kv_index_supervisor, kv_signal_handle) = if kv_aware_ops(default_policy.as_ref())
             .is_some()
         {
             let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
@@ -420,8 +420,8 @@ impl Router {
             );
             let supervisor = Arc::new(supervisor);
             for worker_url in &kv_discovery_urls {
-                if kv_aware_ops(default_policy.as_ref()).is_none()
-                    && !crate::backend::is_grpc_url(worker_url)
+                if kv_aware_ops(default_policy.as_ref())
+                    .is_some_and(|ops| !ops.allows_worker_discovery(worker_url))
                 {
                     continue;
                 }
@@ -468,12 +468,12 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
-            if let Some(consumer) = kv_event_consumer(default_policy.as_ref()) {
+            if let Some(consumer) = kv_aware_ops(default_policy.as_ref()) {
                 if let Some(info) = kv_worker_info.get(worker_arc.base_url()) {
                     let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
                         supervisor.match_provider_for_worker(worker_arc.base_url())
                     });
-                    consumer.bind_worker(worker_arc.as_ref(), info, provider);
+                    consumer.register_worker(worker_arc.as_ref(), info, provider);
                 }
             }
 
@@ -599,8 +599,8 @@ impl Router {
     async fn discover_kv_worker(&self, worker_url: &str) -> Option<crate::kv_index::WorkerKvInfo> {
         let supervisor = self.kv_index_supervisor.as_ref()?;
         let policy = self.policy_registry.get_default_policy();
-        kv_event_consumer(policy.as_ref())?;
-        if kv_aware_ops(policy.as_ref()).is_none() && !crate::backend::is_grpc_url(worker_url) {
+        let ops = kv_aware_ops(policy.as_ref())?;
+        if !ops.allows_worker_discovery(worker_url) {
             return None;
         }
         match supervisor.on_worker_added(worker_url).await {
@@ -624,25 +624,19 @@ impl Router {
     ) {
         let Some(info) = info else { return };
         let policy = self.policy_registry.get_default_policy();
-        let Some(consumer) = kv_event_consumer(policy.as_ref()) else {
+        let Some(consumer) = kv_aware_ops(policy.as_ref()) else {
             return;
         };
         let provider = self
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        consumer.bind_worker(worker, info, provider);
+        consumer.register_worker(worker, info, provider);
     }
 
-    fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
+    fn remove_kv_worker(&self, worker_url: &str) {
         if let Some(supervisor) = &self.kv_index_supervisor {
             supervisor.on_worker_removed(worker_url);
-        }
-        let policy = self.policy_registry.get_default_policy();
-        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
-            for target_url in target_urls {
-                kv_aware.unregister_worker(target_url);
-            }
         }
     }
 
@@ -1314,11 +1308,17 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let context = context.cloned().unwrap_or_default();
+        let mut context = context.cloned().unwrap_or_default();
+        if context.kv.is_none() {
+            context.kv = token_ids.map(|token_ids| KvRequestContext {
+                token_ids,
+                lora_name,
+                cache_salt,
+            });
+        }
         let (idx, kv_receipt, tracker) = if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
-            let receipt = kv_aware
-                .select_worker_with_receipt(&available, token_ids, lora_name, cache_salt)?;
-            (receipt.worker_index, Some(receipt), None)
+            let (receipt, tracker) = kv_aware.select_request_with_receipt(&available, &context)?;
+            (receipt.worker_index, Some(receipt), tracker)
         } else {
             let (idx, tracker) =
                 policy.select_request(&available, text, request_headers.as_ref(), &context)?;
@@ -1475,21 +1475,14 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    let kv_receipt = prepared.as_ref().and_then(|prepared| {
-                        let kv_aware = kv_aware_ops(policy.as_ref())?;
-                        kv_aware.select_worker_with_receipt(
-                            std::slice::from_ref(&worker),
-                            Some(prepared.tokenized.token_ids.as_ref()),
-                            lora_name,
-                            cache_salt,
-                        )
-                    });
-                    if kv_aware_ops(policy.as_ref()).is_some() {
-                        Some(SelectedWorker {
-                            worker,
-                            kv_receipt,
-                            tracker: None,
-                        })
+                    if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+                        kv_aware
+                            .select_request_with_receipt(std::slice::from_ref(&worker), &context)
+                            .map(|(receipt, tracker)| SelectedWorker {
+                                worker,
+                                kv_receipt: Some(receipt),
+                                tracker,
+                            })
                     } else {
                         let request_headers = Self::headers_to_request_headers(headers);
                         policy
@@ -2243,7 +2236,7 @@ impl Router {
             }
         }
         if !removed_urls.is_empty() {
-            self.remove_kv_worker(worker_url, &removed_urls);
+            self.remove_kv_worker(worker_url);
         }
         RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
     }
@@ -3670,6 +3663,7 @@ mod tests {
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                smetric: None,
             }));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
@@ -3716,6 +3710,7 @@ mod tests {
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                smetric: None,
             }));
 
         let request = serde_json::json!({"messages": []});
@@ -4044,6 +4039,7 @@ mod tests {
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
+                    smetric: None,
                 }));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
@@ -4108,6 +4104,7 @@ mod tests {
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                smetric: None,
             }));
         router.retry_config.max_retries = 0;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

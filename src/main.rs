@@ -150,7 +150,7 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "smetric"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "kv_aware", "smetric"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode.
@@ -432,6 +432,7 @@ impl CliArgs {
                 kv_penalty_host: self.kv_penalty_host,
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
+                smetric: smetric.cloned().map(Box::new),
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
@@ -457,8 +458,11 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let smetric_selected =
-            self.policy == "smetric" || self.prefill_policy.as_deref() == Some("smetric");
+        let smetric_selected = self.policy == "smetric"
+            || self.prefill_policy.as_deref() == Some("smetric")
+            || self.smetric_config.is_some()
+                && (self.policy == "kv_aware"
+                    || self.prefill_policy.as_deref() == Some("kv_aware"));
         let smetric = match (smetric_selected, &self.smetric_config) {
             (true, Some(path)) => {
                 let yaml = std::fs::read_to_string(path).map_err(|error| {
@@ -480,9 +484,7 @@ impl CliArgs {
             }
             (false, Some(_)) => {
                 return Err(ConfigError::ValidationFailed {
-                    reason:
-                        "--smetric-config requires --policy smetric or --prefill-policy smetric"
-                            .into(),
+                    reason: "--smetric-config requires a kv_aware or smetric policy".into(),
                 })
             }
             (false, None) => None,
@@ -848,6 +850,86 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_aware_cli_loads_the_smetric_selection_configuration() {
+        let path = format!(
+            "{}/examples/configs/smetric.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "kv_aware",
+            "--smetric-config",
+            &path,
+            "--worker-urls",
+            "http://worker:8000",
+        ])
+        .unwrap();
+        let config = args.to_router_config(vec![]).unwrap();
+        assert!(matches!(
+            config.policy,
+            PolicyConfig::KvAware {
+                smetric: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            vllm_router_rs::policies::PolicyFactory::create_from_config(&config.policy)
+                .needs_affinity_prompt()
+        );
+    }
+
+    #[test]
+    fn kv_aware_smetric_prefill_cli_accepts_the_shared_policy_name() {
+        let path = format!(
+            "{}/examples/configs/smetric.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--policy",
+            "round_robin",
+            "--prefill-policy",
+            "kv_aware",
+            "--smetric-config",
+            &path,
+            "--decode",
+            "http://decode:8000",
+        ])
+        .unwrap();
+        let config = args
+            .to_router_config(vec![("http://prefill:8000".into(), None)])
+            .unwrap();
+        assert!(matches!(
+            &config.mode,
+            RoutingMode::VllmPrefillDecode {
+                prefill_policy: Some(PolicyConfig::KvAware {
+                    smetric: Some(_),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(config.validate().is_ok());
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--policy",
+            "round_robin",
+            "--prefill-policy",
+            "kv_aware",
+            "--decode",
+            "http://decode:8000",
+        ])
+        .unwrap();
+        let config = args
+            .to_router_config(vec![("http://prefill:8000".into(), None)])
+            .unwrap();
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn smetric_policy_without_loaded_config_returns_error() {

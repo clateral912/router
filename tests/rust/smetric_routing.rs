@@ -97,10 +97,19 @@ fn smetric() -> PolicyConfig {
 }
 
 async fn setup(policy: PolicyConfig) -> (AxumRouter, Arc<AppContext>, Vec<Backend>) {
+    setup_with_program(policy, false).await
+}
+
+async fn setup_with_program(
+    policy: PolicyConfig,
+    program: bool,
+) -> (AxumRouter, Arc<AppContext>, Vec<Backend>) {
     let workers = vec![backend("worker-0").await, backend("worker-1").await];
     let urls = workers.iter().map(|w| w.url.clone()).collect::<Vec<_>>();
     let config = RouterConfig {
         policy,
+        program_scheduling: program
+            .then(|| serde_json::from_value(json!({"binding_only":true})).unwrap()),
         mode: RoutingMode::Regular {
             worker_urls: urls.clone(),
         },
@@ -139,6 +148,92 @@ async fn wait_until_idle(ctx: &AppContext) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn forced_program_target_keeps_smetric_work_until_request_cleanup() {
+    let policy = serde_json::from_value(json!({"type":"kv_aware", "smetric": {
+        "C_LIN":1, "C_ATT":0, "PREFILL_RATE":1, "SLACK":1, "HIT_RATIO":0.1,
+        "TTFT_SLO_BASE":100, "TTFT_SLO_PER_CHAR":0, "EVICTION_INTERVAL_SECS":0
+    }}))
+    .unwrap();
+    let (app, ctx, workers) = setup_with_program(policy, true).await;
+    let identity =
+        json!({"agentic_context":{"program_id":"pinned-smetric", "expected_resume":true}});
+    let prefix = "history ".repeat(6);
+    let first = reply_json(app.clone().oneshot(request("/v1/completions",
+        json!({"model":"test-model", "prompt":prefix, "max_tokens":1, "vllm_xargs":identity}), "1")).await.unwrap()).await;
+    let first_index = if first["id"] == "worker-0" { 0 } else { 1 };
+    let held = app.clone().oneshot(request("/v1/completions",
+        json!({"model":"test-model", "prompt":"z".repeat(500), "stream":true, "hold":true, "silent":true, "vllm_xargs":identity}), "1")).await.unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    assert_eq!(
+        ctx.worker_registry
+            .get_by_url(&workers[first_index].url)
+            .unwrap()
+            .load(),
+        1
+    );
+    let next = reply_json(
+        app.oneshot(request(
+            "/v1/completions",
+            json!({"model":"test-model", "prompt":format!("{prefix}next"), "max_tokens":1}),
+            "2",
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_ne!(
+        next["id"], first["id"],
+        "pending work on the forced target must participate in the TTFT gate"
+    );
+    drop(held);
+    wait_until_idle(&ctx).await;
+}
+
+#[tokio::test]
+async fn kv_aware_smetric_mode_keeps_http_continuation_affinity_under_load() {
+    let PolicyConfig::SMetric { config } = smetric() else {
+        unreachable!()
+    };
+    let policy = serde_json::from_value(json!({"type":"kv_aware", "smetric":config})).unwrap();
+    let (app, ctx, workers) = setup(policy).await;
+    let prefix = "shared history ".repeat(20);
+    let first = reply_json(
+        app.clone()
+            .oneshot(request(
+                "/v1/completions",
+                json!({"model":"test-model", "prompt":prefix, "max_tokens":1}),
+                "1",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let warmed_index = if first["id"] == "worker-0" { 0 } else { 1 };
+    let warmed = ctx
+        .worker_registry
+        .get_by_url(&workers[warmed_index].url)
+        .unwrap();
+    warmed.increment_load();
+    let next = reply_json(
+        app.oneshot(request(
+            "/v1/completions",
+            json!({"model":"test-model", "prompt":format!("{prefix}next turn"), "max_tokens":1}),
+            "2",
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        next["id"], first["id"],
+        "configured SMetric affinity must survive the shared KV-aware entry point"
+    );
+    assert_eq!(warmed.load(), 1);
+    warmed.decrement_load();
+    wait_until_idle(&ctx).await;
 }
 
 #[tokio::test]

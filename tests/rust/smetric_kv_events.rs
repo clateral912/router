@@ -62,16 +62,35 @@ async fn wait_for_target(app: &axum::Router, expected: &str) {
 
 #[tokio::test]
 async fn smetric_grpc_placement_tracks_events_gaps_and_worker_removal() {
+    run_event_placement(false).await;
+}
+
+#[tokio::test]
+async fn kv_aware_smetric_mode_uses_affinity_instead_of_multiplicative_score() {
+    run_event_placement(true).await;
+}
+
+async fn run_event_placement(shared_mode: bool) {
     let cold = EventWorker::spawn("cold").await;
     let hot = EventWorker::spawn("hot").await;
     let urls = vec![cold.url.clone(), hot.url.clone()];
+    let smetric: Box<vllm_router_rs::config::SMetricConfig> = serde_yaml::from_str(
+        "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n"
+    ).unwrap();
+    let policy = if shared_mode {
+        serde_json::from_value(json!({"type":"kv_aware", "smetric":smetric})).unwrap()
+    } else {
+        PolicyConfig::SMetric { config: smetric }
+    };
     let config = RouterConfig {
-        mode: RoutingMode::Regular { worker_urls: urls.clone() },
-        policy: PolicyConfig::SMetric { config: serde_yaml::from_str(
-            "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n"
-        ).unwrap() },
-        disable_retries: true, disable_circuit_breaker: true,
-        worker_startup_timeout_secs: 5, worker_startup_check_interval_secs: 1,
+        mode: RoutingMode::Regular {
+            worker_urls: urls.clone(),
+        },
+        policy,
+        disable_retries: true,
+        disable_circuit_breaker: true,
+        worker_startup_timeout_secs: 5,
+        worker_startup_check_interval_secs: 1,
         ..RouterConfig::default()
     };
     let ctx = create_test_context(config.clone());
@@ -80,7 +99,9 @@ async fn smetric_grpc_placement_tracks_events_gaps_and_worker_removal() {
     cold.wait_for_subscription().await;
     hot.wait_for_subscription().await;
     let hot_worker = ctx.worker_registry.get_by_url(&hot.url).unwrap();
-    hot_worker.increment_load();
+    for _ in 0..20 {
+        hot_worker.increment_load();
+    }
     let router = Arc::new(router);
     let app = create_test_app(router.clone(), reqwest::Client::new(), &config);
     let stored = json!({"type":"BlockStored", "block_hashes":[101,102],
@@ -109,12 +130,14 @@ async fn smetric_grpc_placement_tracks_events_gaps_and_worker_removal() {
     router.remove_worker(&hot.url);
     assert!(ctx.worker_registry.get_by_url(&hot.url).is_none());
     assert_eq!(selected_worker(&app).await, "cold");
-    assert_eq!(hot_worker.load(), 1);
+    assert_eq!(hot_worker.load(), 20);
     for worker in [&cold, &hot] {
         for request in worker.state.captured.lock().unwrap().iter() {
             assert_eq!(request.token_ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
             assert!(!request.had_text_prompt);
         }
     }
-    hot_worker.decrement_load();
+    for _ in 0..20 {
+        hot_worker.decrement_load();
+    }
 }

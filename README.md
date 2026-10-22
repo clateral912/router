@@ -236,7 +236,7 @@ The router supports multiple load balancing policies:
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
-| `smetric` | Balances estimated prefill work with TTFT-gated prefix reuse | Yes (conditional) | Text-based agent workloads |
+| `smetric` | Alias for KV-aware SMetric selection: estimated prefill work with TTFT-gated prefix reuse | Yes (conditional) | Text-based agent workloads |
 
 ```bash
 # Example: Using consistent_hash with HTTP header for session affinity
