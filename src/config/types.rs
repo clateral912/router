@@ -650,6 +650,31 @@ impl RoutingMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub struct SMetricConfig {
+    pub c_lin: f64,
+    pub c_att: f64,
+    pub prefill_rate: Option<f64>,
+    pub slack: f64,
+    pub hit_ratio: f64,
+    /// ttft_slo(req) = base + per_char * L, where L is the text character count.
+    pub ttft_slo_base: f64,
+    pub ttft_slo_per_char: f64,
+    #[serde(default = "default_smetric_tree_size")]
+    pub max_tree_size: usize,
+    #[serde(default = "default_smetric_eviction_interval_secs")]
+    pub eviction_interval_secs: u64,
+}
+
+fn default_smetric_eviction_interval_secs() -> u64 {
+    30
+}
+
+fn default_smetric_tree_size() -> usize {
+    67_108_864
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -674,6 +699,21 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    /// Event-driven, multi-tier KV placement plus live prefill/load scoring.
+    #[serde(rename = "kv_aware")]
+    KvAware {
+        /// Zero selects the minimum cost; positive values softmax-sample.
+        #[serde(default)]
+        router_temperature: f64,
+        /// Transfer credits in [0, 1]; lower means a costlier tier.
+        #[serde(default = "default_kv_penalty_host")]
+        kv_penalty_host: f64,
+        #[serde(default = "default_kv_penalty_external")]
+        kv_penalty_external: f64,
+        #[serde(default = "default_kv_penalty_disk")]
+        kv_penalty_disk: f64,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         /// Interval for load monitoring (seconds)
@@ -688,6 +728,9 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+
+    #[serde(rename = "smetric")]
+    SMetric { config: Box<SMetricConfig> },
 }
 
 impl PolicyConfig {
@@ -696,11 +739,25 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::SMetric { .. } => "smetric",
         }
     }
+}
+
+fn default_kv_penalty_host() -> f64 {
+    0.8
+}
+
+fn default_kv_penalty_external() -> f64 {
+    0.6
+}
+
+fn default_kv_penalty_disk() -> f64 {
+    0.3
 }
 
 /// Service discovery configuration
