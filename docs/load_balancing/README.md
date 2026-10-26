@@ -252,8 +252,12 @@ only when the turn/history gate and estimated first-token latency budget allow i
 It supports text chat, including serialized tool metadata, and single-string
 completion prompts for cache affinity.
 
+These examples use the Rust CLI built from this repository. The Python launcher
+installed by `pip` does not expose SMetric configuration.
+
 ```bash
-vllm-router --policy kv_aware \
+cargo build --release --bin vllm-router
+./target/release/vllm-router --policy kv_aware \
   --smetric-config examples/configs/smetric.yaml \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
@@ -288,7 +292,7 @@ The engine must expose its KV Events configuration through the gRPC Control
 service and publish events. No additional SMetric configuration is needed:
 
 ```bash
-vllm-router --policy kv_aware \
+./target/release/vllm-router --policy kv_aware \
   --smetric-config examples/configs/smetric.yaml \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```

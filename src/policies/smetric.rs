@@ -1,6 +1,6 @@
 //! SMetric: session cache affinity with a prefill-work fallback.
 use super::{RequestObserver, RequestTracker, RoutingContext};
-pub(super) mod kv;
+mod kv;
 use crate::config::SMetricConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -306,7 +306,7 @@ impl SMetricStrategy {
         }
     }
 
-    pub(super) fn select_request(
+    fn select_request(
         &self,
         workers: &[Arc<dyn Worker>],
         context: &RoutingContext<'_>,

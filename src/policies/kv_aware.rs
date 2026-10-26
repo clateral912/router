@@ -7,7 +7,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rand::Rng;
 
-use super::smetric::{kv::prefix_match, SMetricStrategy};
+use super::smetric::SMetricStrategy;
 use super::{
     get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders, RequestTracker, RoutingContext,
 };
@@ -738,34 +738,22 @@ impl KvAwarePolicy {
             if matches_by_identity.contains_key(&identity) {
                 continue;
             }
-            let local_hashes = if placement_enabled {
-                token_ids
-                    .map(|ids| {
-                        let ids = if self.smetric.is_some() {
-                            let b = binding.block_size as usize;
-                            let complete = ids.len().checked_div(b).unwrap_or(0) * b;
-                            &ids[..complete]
-                        } else {
-                            ids
-                        };
-                        Self::local_hashes_with_lora(ids, binding.block_size, lora_name)
-                    })
-                    .unwrap_or_default()
+            let query_tokens = token_ids.filter(|_| placement_enabled);
+            let query = if self.smetric.is_some() {
+                SMetricStrategy::match_query(query_tokens, binding.block_size, lora_name)
             } else {
-                Vec::new()
-            };
-            let matches = if local_hashes.is_empty() {
-                Vec::new()
-            } else {
-                binding.matches.find_tiered_matches(&MatchQuery {
+                MatchQuery {
                     group_idx: 0,
-                    local_hashes,
-                    tiers_of_interest: if self.smetric.is_some() {
-                        vec![StorageTier::Device]
-                    } else {
-                        Self::tiers_of_interest()
-                    },
-                })
+                    local_hashes: query_tokens
+                        .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
+                        .unwrap_or_default(),
+                    tiers_of_interest: Self::tiers_of_interest(),
+                }
+            };
+            let matches = if query.local_hashes.is_empty() {
+                Vec::new()
+            } else {
+                binding.matches.find_tiered_matches(&query)
             };
             matches_by_identity.insert(identity, matches);
         }
@@ -803,47 +791,13 @@ impl KvAwarePolicy {
             .collect();
 
         if let Some(strategy) = &self.smetric {
-            let empty_context = RoutingContext::default();
-            let context = context.unwrap_or(&empty_context);
-            let chars = context
-                .prompt
-                .map_or(0, |prompt| prompt.text.chars().count());
-            let hits = context.kv.as_ref().map(|_| {
-                candidates
-                    .iter()
-                    .zip(&bindings)
-                    .map(|(candidate, binding)| prefix_match(candidate, binding.block_size, chars))
-                    .collect::<Vec<_>>()
-            });
-            let selected_workers: Vec<_> = healthy.iter().map(|&i| workers[i].clone()).collect();
-            let loads: Vec<_> = candidates
-                .iter()
-                .map(|candidate| candidate.load.active_requests)
-                .collect();
-            let (picked, tracker, score) = strategy.select_request(
-                &selected_workers,
+            return strategy.select_candidates(
+                workers,
+                &healthy,
+                &candidates,
+                bindings.iter().map(|binding| binding.block_size),
                 context,
-                hits.as_deref(),
-                Some(&loads),
-            )?;
-            let new_prefill_tokens = input_tokens
-                .saturating_sub(hits.as_ref().map_or(0, |hits| hits[picked].tokens))
-                as u64;
-            return Some((
-                KvSelectionReceipt {
-                    worker_index: healthy[picked],
-                    new_prefill_tokens,
-                    decision: CostDecision {
-                        target: bindings[picked].target.clone(),
-                        cost: score as f64,
-                        components: CostComponents {
-                            ptoken: new_prefill_tokens,
-                            batchsize: loads[picked],
-                        },
-                    },
-                },
-                tracker,
-            ));
+            );
         }
 
         let mut costs = vec![0.0; candidates.len()];
@@ -969,10 +923,6 @@ impl LoadBalancingPolicy for KvAwarePolicy {
     fn needs_affinity_prompt(&self) -> bool {
         self.smetric.is_some()
     }
-    fn tracks_load(&self) -> bool {
-        self.smetric.is_some()
-    }
-
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1001,32 +951,20 @@ impl KvAwareOps for KvAwarePolicy {
         let id = worker as *const dyn Worker as *const () as usize;
         if let Some(strategy) = &self.smetric {
             strategy.with_active_worker(worker, || {
-                let rank = crate::backend::parse_dp_rank(worker.url())
-                    .or_else(|| worker.dp_rank().and_then(|rank| u32::try_from(rank).ok()))
-                    .or(info.default_rank);
-                if let (Some(rank), Some(key), Some(provider)) =
-                    (rank, info.cache_key.as_ref(), matches)
+                if let (Some((target, key)), Some(provider)) =
+                    (SMetricStrategy::binding_target(worker, info), matches)
                 {
-                    if key.block_size > 0
-                        && info.block_size == Some(key.block_size)
-                        && info.ranks.contains(&rank)
-                        && !info.instance_id.is_empty()
-                    {
-                        self.targets.insert(
-                            worker.url().to_string(),
-                            TargetBinding {
-                                worker_id: Some(id),
-                                target: RoutableTarget {
-                                    instance_id: Arc::from(info.instance_id.as_str()),
-                                    dp_rank: rank,
-                                },
-                                cache_key: Some(key.clone()),
-                                block_size: key.block_size,
-                                matches: provider,
-                            },
-                        );
-                        return;
-                    }
+                    self.targets.insert(
+                        worker.url().to_string(),
+                        TargetBinding {
+                            worker_id: Some(id),
+                            target,
+                            block_size: key.block_size,
+                            cache_key: Some(key),
+                            matches: provider,
+                        },
+                    );
+                    return;
                 }
                 self.targets
                     .remove_if(worker.url(), |_, binding| binding.worker_id == Some(id));

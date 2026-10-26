@@ -155,11 +155,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
-    /// Opt in to router-owned request-lifecycle load accounting.
-    fn tracks_load(&self) -> bool {
-        false
-    }
-
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.

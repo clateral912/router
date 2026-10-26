@@ -1532,7 +1532,7 @@ impl Router {
                     kv_aware.begin_request(kv_receipt?)
                 });
 
-                let load_incremented = if (policy.tracks_load() || policy.name() == "kv_aware")
+                let load_incremented = if matches!(policy.name(), "cache_aware" | "kv_aware")
                     || program_completion.is_some()
                 {
                     worker.increment_load();
@@ -2858,7 +2858,7 @@ impl RouterTrait for Router {
         // Match the typed path's load accounting so tracked policies also
         // see transparent (EPD) traffic.
         let load_tracked =
-            (policy.tracks_load() || policy.name() == "kv_aware") || program_completion.is_some();
+            matches!(policy.name(), "cache_aware" | "kv_aware") || program_completion.is_some();
         if load_tracked {
             worker.increment_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
