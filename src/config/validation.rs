@@ -19,6 +19,41 @@ impl ConfigValidator {
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            discovery_address,
+            ..
+        } = &config.mode
+        {
+            if let Some(policy) = prefill_policy {
+                Self::validate_policy(policy)?;
+            }
+            if let Some(policy) = decode_policy {
+                Self::validate_policy(policy)?;
+            }
+            if decode_policy
+                .as_ref()
+                .unwrap_or(&config.policy)
+                .smetric_config()
+                .is_some()
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "SMetric is a prefill policy; select another decode policy".into(),
+                });
+            }
+            if discovery_address.is_some()
+                && prefill_policy
+                    .as_ref()
+                    .unwrap_or(&config.policy)
+                    .smetric_config()
+                    .is_some()
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "SMetric requires persistent workers; vLLM ZMQ discovery recreates workers per request".into(),
+                });
+            }
+        }
         Self::validate_server_settings(config)?;
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
@@ -389,6 +424,38 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::SMetric { config } => Self::validate_smetric(config)?,
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+                smetric,
+            } => {
+                if let Some(config) = smetric {
+                    Self::validate_smetric(config)?;
+                }
+                if !router_temperature.is_finite() || *router_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "router_temperature".to_string(),
+                        value: router_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+                for (field, value) in [
+                    ("kv_penalty_host", kv_penalty_host),
+                    ("kv_penalty_external", kv_penalty_external),
+                    ("kv_penalty_disk", kv_penalty_disk),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be finite and between 0.0 and 1.0".to_string(),
+                        });
+                    }
+                }
+            }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
             } => {
@@ -605,6 +672,47 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_smetric(config: &super::types::SMetricConfig) -> ConfigResult<()> {
+        if config
+            .prefill_rate
+            .is_some_and(|rate| !rate.is_finite() || rate <= 0.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "PREFILL_RATE".into(),
+                value: format!("{:?}", config.prefill_rate),
+                reason: "Must be finite and positive when configured".into(),
+            });
+        }
+        for (field, value, positive) in [
+            ("C_LIN", config.c_lin, false),
+            ("C_ATT", config.c_att, false),
+            ("SLACK", config.slack, true),
+            ("HIT_RATIO", config.hit_ratio, false),
+            ("TTFT_SLO_BASE", config.ttft_slo_base, false),
+            ("TTFT_SLO_PER_CHAR", config.ttft_slo_per_char, false),
+        ] {
+            if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: value.to_string(),
+                    reason: "Must be finite and nonnegative (positive for rates and slack)".into(),
+                });
+            }
+        }
+        if config.c_lin == 0.0 && config.c_att == 0.0
+            || config.ttft_slo_base == 0.0 && config.ttft_slo_per_char == 0.0
+            || config.max_tree_size == 0
+            || config.hit_ratio > 1.0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "SMetric requires nonzero cost/SLO models, MAX_TREE_SIZE > 0 and HIT_RATIO <= 1"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         if config.program_scheduling.is_some()
@@ -615,13 +723,40 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
+        if config.policy.smetric_config().is_some()
+            && (config.enable_igw || matches!(config.mode, RoutingMode::OpenAI { .. }))
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "SMetric supports regular routing or vLLM P/D prefill, not OpenAI/IGW"
+                    .into(),
+            });
+        }
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
             return Ok(());
         }
 
-        // All policies are now supported for both router types thanks to the unified trait design
-        // No mode/policy restrictions needed anymore
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
+            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
+            if matches!(
+                effective_prefill,
+                PolicyConfig::KvAware { smetric: None, .. }
+            ) || matches!(
+                effective_decode,
+                PolicyConfig::KvAware { smetric: None, .. }
+            ) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_aware is supported only in regular mode, not PD disaggregation"
+                        .to_string(),
+                });
+            }
+        }
 
         // Check if service discovery is enabled for worker count validation.
         // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
@@ -1133,6 +1268,93 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn kv_aware_smetric_preserves_prefill_and_discovery_restrictions() {
+        let smetric: super::super::types::SMetricConfig =
+            serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
+        let selection: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":smetric}))
+                .unwrap();
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".into(), None)],
+                decode_urls: vec!["http://decode:8000".into()],
+                prefill_policy: Some(selection.clone()),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+                discovery_address: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = Some(selection.clone());
+        }
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+        if let RoutingMode::VllmPrefillDecode {
+            decode_policy,
+            discovery_address,
+            ..
+        } = &mut config.mode
+        {
+            *decode_policy = Some(PolicyConfig::RoundRobin);
+            *discovery_address = Some("tcp://discovery:5557".into());
+        }
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+        config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".into()],
+            },
+            selection,
+        );
+        config.enable_igw = true;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn kv_aware_smetric_validates_the_nested_cost_model() {
+        let mut smetric: super::super::types::SMetricConfig =
+            serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
+        smetric.c_lin = -1.0;
+        let selection: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":smetric}))
+                .unwrap();
+        assert!(
+            matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "C_LIN")
+        );
+    }
+
+    #[test]
+    fn test_rejects_kv_aware_for_disaggregated_pd_mode() {
+        let config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                smetric: None,
+            },
+        );
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not PD disaggregation"));
     }
 
     #[test]

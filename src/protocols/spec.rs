@@ -268,7 +268,12 @@ pub struct StructuredOutputsParams {
 #[serde(untagged)]
 pub enum UserMessageContent {
     Text(String),
-    Parts(Vec<ContentPart>),
+    /// Content parts are kept as raw JSON so that every part type vLLM
+    /// understands (`text`, `image_url`, `audio_url`, `input_audio`,
+    /// `video_url`, ...) is forwarded verbatim. Typing only a subset made an
+    /// unknown part type fail the whole `Parts` deserialization, which the
+    /// `ChatMessage` deserializer then turned into empty text (see #322).
+    Parts(Vec<Value>),
 }
 
 impl UserMessageContent {
@@ -279,29 +284,54 @@ impl UserMessageContent {
             Self::Text(_) => Vec::new(),
             Self::Parts(parts) => parts
                 .iter()
-                .filter_map(|part| match part {
-                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
-                    _ => None,
-                })
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|text| !text.trim().is_empty())
                 .collect(),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum ContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ImageUrl {
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>, // "auto", "low", or "high"
+fn tool_content_is_text_only(content: &Value, is_content_part: bool) -> bool {
+    match content {
+        Value::Array(parts) => parts
+            .iter()
+            .all(|part| tool_content_is_text_only(part, is_content_part)),
+        Value::Object(object) => {
+            if let Some(kind) = object.get("type") {
+                if is_content_part
+                    && (kind.as_str() != Some("text")
+                        || !object.get("text").is_some_and(Value::is_string))
+                {
+                    return false;
+                }
+                if matches!(
+                    kind.as_str(),
+                    Some(
+                        "image_url"
+                            | "image_embeds"
+                            | "audio_embeds"
+                            | "video_embeds"
+                            | "input_image"
+                            | "input_audio"
+                            | "audio"
+                            | "image"
+                            | "video"
+                            | "video_url"
+                            | "input_video"
+                            | "file"
+                            | "input_file"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            object
+                .iter()
+                .all(|(key, value)| tool_content_is_text_only(value, key == "content"))
+        }
+        _ => true,
+    }
 }
 
 // ============= Response Format Types =============
@@ -364,7 +394,7 @@ pub struct FunctionCallDelta {
 
 // ============= Request =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use (optional, vLLM supports requests without model)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -568,6 +598,65 @@ impl GenerationRequest for ChatCompletionRequest {
             .filter(|session_id| !session_id.trim().is_empty())
             .unwrap_or_default()
             .to_string()
+    }
+    fn extract_affinity_prompt(&self) -> Option<RoutingPrompt> {
+        let mut text = Vec::new();
+        // Stable static metadata precedes messages, so appending a turn preserves prefixes.
+        if let Some(tools) = &self.tools {
+            text.extend_from_slice(b"tools:");
+            serde_json::to_writer(&mut text, tools).ok()?;
+            text.push(b'\n');
+        }
+        if let Some(functions) = &self.functions {
+            text.extend_from_slice(b"functions:");
+            serde_json::to_writer(&mut text, functions).ok()?;
+            text.push(b'\n');
+        }
+        let mut chars = std::str::from_utf8(&text).ok()?.chars().count();
+        let mut est_hit_chars = 0;
+        for message in &self.messages {
+            let content = match message {
+                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                    Some(content)
+                }
+                ChatMessage::Assistant { content, .. } => content.as_ref(),
+                ChatMessage::Other(_) => return None,
+                ChatMessage::Tool { content, .. }
+                    if !tool_content_is_text_only(content, content.is_array()) =>
+                {
+                    return None;
+                }
+                _ => None,
+            };
+            if content.is_some_and(|content| {
+                matches!(content, UserMessageContent::Parts(parts)
+            if parts.iter().any(|part| part.get("type").and_then(Value::as_str) != Some("text")
+                || !part.get("text").is_some_and(Value::is_string)))
+            }) {
+                return None; // No text-only approximation for multimodal input.
+            }
+            let start = text.len();
+            serde_json::to_writer(&mut text, message).ok()?;
+            text.push(b'\n');
+            chars += std::str::from_utf8(&text[start..]).ok()?.chars().count();
+            if matches!(message, ChatMessage::Assistant { .. }) {
+                est_hit_chars = chars;
+            }
+        }
+        Some(RoutingPrompt {
+            text: String::from_utf8(text).ok()?,
+            est_hit_chars,
+        })
+    }
+
+    fn allows_cache_affinity(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Assistant { .. }))
+    }
+
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        Some(GrpcRequestRef::Chat(self))
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -886,11 +975,55 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
+        // Keep generic completion routing prompt-based: this also feeds HTTP
+        // affinity and Program token estimation. gRPC completions apply
+        // session affinity at the typed routing boundary below.
         self.prompt.extract_text_for_routing()
+    }
+    fn extract_affinity_prompt(&self) -> Option<RoutingPrompt> {
+        match &self.prompt {
+            PromptInput::String(text) => Some(RoutingPrompt {
+                text: text.clone(),
+                est_hit_chars: text.chars().count(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn allows_cache_affinity(&self) -> bool {
+        // Completion lacks a structured turn boundary; still check cache and TTFT.
+        true
+    }
+
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        Some(GrpcRequestRef::Completion(self))
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         program_identity_payload(&self.other, self.user.as_deref())
+    }
+}
+
+impl CompletionRequest {
+    /// Routing key for typed gRPC completions. Session affinity is only used
+    /// on this path; token-array prompts without a session have no useful
+    /// prefix key because the generic prompt representation contains only
+    /// their length.
+    pub fn extract_text_for_grpc_routing(&self) -> String {
+        if let Some(session_id) = self
+            .session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+        {
+            return session_id.to_string();
+        }
+
+        match &self.prompt {
+            PromptInput::IntArray(_) => String::new(),
+            prompt => prompt.extract_text_for_routing(),
+        }
     }
 }
 
@@ -922,6 +1055,12 @@ pub struct CompletionChoice {
     /// Hidden states from the model (VLLM extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
+    /// vLLM extension: the client's prompt ids, for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ============= Streaming Response =============
@@ -933,6 +1072,9 @@ pub struct CompletionStreamResponse {
     pub created: u64,
     pub choices: Vec<CompletionStreamChoice>,
     pub model: String,
+    /// Final usage chunk (`stream_options.include_usage`), vLLM-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
 }
@@ -944,6 +1086,9 @@ pub struct CompletionStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ==================================================================
@@ -2408,6 +2553,40 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Concretely-typed request behind a [`GenerationRequest`] value.
+///
+/// A gRPC pool only serves `/v1/chat/completions` and `/v1/completions`, so the
+/// prepare path can use the concrete request instead of roundtripping it
+/// through `serde_json::Value`.
+pub enum GrpcRequestRef<'a> {
+    Chat(&'a ChatCompletionRequest),
+    Completion(&'a CompletionRequest),
+}
+
+/// Text-only affinity input with the historical boundary at the last assistant turn.
+pub struct RoutingPrompt {
+    pub text: String,
+    pub est_hit_chars: usize,
+}
+
+/// Extract optional affinity metadata without cloning an intermediate JSON value.
+pub fn affinity_prompt_from_json(route: &str, body: &Value) -> Option<(RoutingPrompt, bool)> {
+    fn extract<T: GenerationRequest + for<'de> Deserialize<'de>>(
+        body: &Value,
+    ) -> Option<(RoutingPrompt, bool)> {
+        let request = T::deserialize(body).ok()?;
+        Some((
+            request.extract_affinity_prompt()?,
+            request.allows_cache_affinity(),
+        ))
+    }
+    match route {
+        "/v1/chat/completions" => extract::<ChatCompletionRequest>(body),
+        "/v1/completions" => extract::<CompletionRequest>(body),
+        _ => None,
+    }
+}
+
 /// Common trait for all generation requests across different APIs
 pub trait GenerationRequest: Send + Sync {
     /// Check if the request is for streaming
@@ -2418,6 +2597,14 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+    /// Return a text prompt and historical prefix length; multimodal and token-ID inputs are unsupported.
+    fn extract_affinity_prompt(&self) -> Option<RoutingPrompt> {
+        None
+    }
+
+    fn allows_cache_affinity(&self) -> bool {
+        false
+    }
 
     /// Extract prompt content used only by opted-in Program scheduling.
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -2426,6 +2613,15 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Concretely-typed view of this request for the gRPC prepare path.
+    ///
+    /// The gRPC pool serves only `/v1/chat/completions` and `/v1/completions`;
+    /// the generic path uses this to reach the concrete type instead of a
+    /// `serde_json::Value` roundtrip. Types the pool never serves keep `None`.
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
         None
     }
 }
@@ -2600,6 +2796,164 @@ mod tests {
         assert!(payload.get("prompt").is_none());
         assert!(payload.get("messages").is_none());
     }
+
+    #[test]
+    fn smetric_chat_history_is_an_append_only_prefix() {
+        let history: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let full: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "next"}
+            ]
+        }))
+        .unwrap();
+        let history_text = history.extract_affinity_prompt().unwrap().text;
+        let prompt = full.extract_affinity_prompt().unwrap();
+        assert!(prompt.text.starts_with(&history_text));
+        assert_eq!(prompt.est_hit_chars, history_text.chars().count());
+        assert!(full.allows_cache_affinity());
+    }
+
+    #[test]
+    fn smetric_unknown_chat_parts_do_not_enable_affinity() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "prefix"},
+                    {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(request.extract_affinity_prompt().is_none());
+    }
+
+    #[test]
+    fn smetric_unknown_roles_preserve_forwarding_without_affinity() {
+        for content in [
+            serde_json::json!("Model-specific instructions"),
+            serde_json::json!([
+                {"type": "text", "text": "prefix"},
+                {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "developer", "content": content, "metadata": {"priority": 1}}
+                ]
+            });
+            assert!(affinity_prompt_from_json("/v1/chat/completions", &body).is_none());
+            let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["messages"],
+                body["messages"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_media_parts_do_not_enable_affinity() {
+        for content in [
+            serde_json::json!([
+                {"type": "text", "text": "tool result"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}
+            ]),
+            serde_json::json!([
+                {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+            ]),
+            serde_json::json!([
+                {"type": "future_media", "payload": "AQID"}
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": content}
+                ]
+            });
+            assert!(
+                affinity_prompt_from_json("/v1/chat/completions", &body).is_none(),
+                "unexpected affinity for {}",
+                body["messages"][1]["content"]
+            );
+            let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["messages"],
+                body["messages"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_nested_media_does_not_enable_affinity() {
+        for content in [
+            serde_json::json!({"type": "image_embeds", "image_embeds": {"image_grid_thw": [1, 2, 3]}}),
+            serde_json::json!({"type": "audio_embeds", "audio_embeds": {"length": 128}}),
+            serde_json::json!({"type": "video_embeds", "video_embeds": {"frames": 4}}),
+            serde_json::json!({
+                "type": "image_url", "image_url": {"url": "https://example.com/image.png"}
+            }),
+            serde_json::json!({
+                "result": {"content": [
+                    {"type": "text", "text": "tool result"},
+                    {"type": "input_audio", "input_audio": {"data": "AQID", "format": "wav"}}
+                ]}
+            }),
+            serde_json::json!({
+                "result": {"content": [{"type": "future_media", "payload": "AQID"}]}
+            }),
+            serde_json::json!([
+                [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]
+            ]),
+        ] {
+            let body = serde_json::json!({
+                "messages": [{"role": "tool", "tool_call_id": "call_1", "content": content}]
+            });
+            assert!(
+                affinity_prompt_from_json("/v1/chat/completions", &body).is_none(),
+                "unexpected affinity for {}",
+                body["messages"][0]["content"]
+            );
+        }
+    }
+
+    #[test]
+    fn smetric_tool_text_and_business_json_preserve_affinity() {
+        for content in [
+            serde_json::json!("tool result"),
+            serde_json::json!([{ "type": "text", "text": "tool result" }]),
+            serde_json::json!({
+                "type": "invoice", "total": 21,
+                "items": [{"type": "product", "name": "image_url"}],
+                "image_url": "https://example.com/product.png"
+            }),
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "tool result"}]}}),
+        ] {
+            let body = serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "previous completion"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": content}
+                ]
+            });
+            let (prompt, cache_affinity) =
+                affinity_prompt_from_json("/v1/chat/completions", &body).unwrap();
+            assert!(cache_affinity);
+            assert_eq!(prompt.est_hit_chars, 53);
+            let tool_message: Value =
+                serde_json::from_str(prompt.text.lines().nth(1).unwrap()).unwrap();
+            assert_eq!(tool_message["content"], body["messages"][1]["content"]);
+        }
+    }
+
     use serde_json;
 
     // ==================================================================
@@ -3943,6 +4297,61 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_message_user_multimodal_parts_are_preserved() {
+        let json = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}},
+                {"type": "text", "text": "Return W0_TANGERINE_4931"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        // Parts pass through verbatim instead of collapsing to empty text (#322).
+        assert_eq!(serde_json::to_value(&message).unwrap(), json);
+
+        // Only the text part contributes to prefix-aware routing.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [json]
+        }))
+        .unwrap();
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:Return W0_TANGERINE_4931"
+        );
+    }
+
+    #[test]
+    fn test_user_part_routing_ignores_non_text_parts() {
+        // A non-text part that happens to carry a top-level `text` field must not
+        // influence prefix-aware routing.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "https://example.com/v.mp4"},
+                            "text": "should-be-ignored"
+                        },
+                        {"type": "text", "text": "real prompt"}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:real prompt"
+        );
+    }
+
+    #[test]
     fn test_chat_request_program_text_includes_system_content_blocks() {
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "test-model",
@@ -3982,6 +4391,71 @@ mod tests {
         assert_eq!(
             request.extract_text_for_program_scheduling(),
             "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_completion_request_routing_stays_prompt_based_with_session_id() {
+        let session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "completion prompt",
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+        assert_eq!(session.extract_text_for_routing(), "completion prompt");
+        assert_eq!(
+            session.extract_text_for_program_scheduling(),
+            "completion prompt"
+        );
+
+        let grpc_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+        assert_eq!(grpc_session.extract_text_for_routing(), "token_ids:3");
+        assert_eq!(
+            grpc_session.extract_text_for_grpc_routing(),
+            "stable-session"
+        );
+
+        let no_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3]
+        }))
+        .unwrap();
+        assert_eq!(no_session.extract_text_for_routing(), "token_ids:3");
+        assert_eq!(no_session.extract_text_for_grpc_routing(), "");
+    }
+
+    #[test]
+    fn test_completion_grpc_routing_preserves_literal_prompt_and_ignores_blank_session() {
+        let literal: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "token_ids: explain this field",
+            "session_params": {"session_id": "  "}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            literal.extract_text_for_routing(),
+            "token_ids: explain this field"
+        );
+        assert_eq!(
+            literal.extract_text_for_grpc_routing(),
+            "token_ids: explain this field"
+        );
+
+        let literal_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "session_params": {"session_id": "token_ids:customer-42"}
+        }))
+        .unwrap();
+        assert_eq!(
+            literal_session.extract_text_for_grpc_routing(),
+            "token_ids:customer-42"
         );
     }
 

@@ -14,6 +14,8 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
+| `smetric` (alias of KV-aware SMetric selection) | Text-based agent workloads with a TTFT budget | Yes (conditional cache affinity) | Yes |
+| `kv_aware` | Tiered KV reuse and live-load scoring; optional SMetric TTFT gate | Conditional in SMetric mode | Yes |
 
 ---
 
@@ -231,11 +233,134 @@ vllm-router --policy cache_aware \
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
 
+Transparent proxy requests now contribute to worker load and `running_requests`
+for both `cache_aware` and SMetric, including while a streamed response is open.
+This can affect `cache_aware` balancing for deployments using those endpoints.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
 - When prefix caching is enabled on vLLM workers
 - Multi-tenant deployments with distinct prompt patterns
+
+---
+
+## SMetric selection
+
+SMetric is an optional selection mode of `KvAwarePolicy`. It balances estimated prefill work and reuses a cached prefix
+only when the turn/history gate and estimated first-token latency budget allow it.
+It supports text chat, including serialized tool metadata, and single-string
+completion prompts for cache affinity.
+
+These examples use the Rust CLI built from this repository. The Python launcher
+installed by `pip` does not expose SMetric configuration.
+
+```bash
+cargo build --release --bin vllm-router
+./target/release/vllm-router --policy kv_aware \
+  --smetric-config examples/configs/smetric.yaml \
+  --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+`--smetric-config` selects SMetric within `kv_aware`; without it, the existing
+multiplicative scorer and picker remain the default. `--policy smetric` remains
+a compatibility alias for the same implementation. YAML router configuration
+can select this mode with `policy: {type: kv_aware, smetric: {...}}`.
+
+Worker binding, event queries and candidate collection are shared by both modes.
+SMetric retains its character-cost and rate history because these quantities
+are different from the default mode's token counters. Its `RequestTracker`
+uses the same router request-lifecycle guard; it does not add a second token
+slot reservation. HTTP and P/D prefill retain the existing Tree behavior.
+Temperature and non-device transfer-credit options apply to the default mode;
+SMetric uses its deterministic affinity/budget rule and local GPU prefix credit.
+
+The YAML is required to select SMetric; calibrate its character-based cost coefficients, rate and
+TTFT budget for the deployment. Omit `PREFILL_RATE` to learn a per-worker rate
+from the first generated output in a stream or successful PD prefill completion.
+Stream metadata and error events do not train the rate estimate.
+An explicit rate stays fixed. `MAX_TREE_SIZE` defaults to 67,108,864 characters
+per worker. The optional `EVICTION_INTERVAL_SECS` defaults to 30; set it to `0`
+to disable size eviction. Dropping the policy stops its eviction thread.
+
+### Cache state and token input
+
+HTTP workers, including the HTTP P/D path, continue to use the request-history
+Tree. With regular gRPC chat workers, SMetric reuses the shared KV Events
+discovery and index, querying the same prepared token IDs sent to the engine.
+The engine must expose its KV Events configuration through the gRPC Control
+service and publish events. No additional SMetric configuration is needed:
+
+```bash
+./target/release/vllm-router --policy kv_aware \
+  --smetric-config examples/configs/smetric.yaml \
+  --worker-urls grpc://worker1:8000 grpc://worker2:8000
+```
+
+An unpinned address needs Control metadata confirming a single DP rank.
+Explicit `@rank` addresses bind to that rank; an ambiguous target receives
+no event-derived credit.
+
+SMetric credits contiguous local GPU blocks in cache group 0, capped at the
+complete blocks before the final prompt token that must be recomputed for
+logits. Host and external cache tiers receive no credit. The index handles
+block removals, cache clears and event sequence gaps; worker removal also
+clears SMetric's binding. Token requests do not populate or consult the Tree.
+Missing metadata or prefix evidence, and requests with a nonempty `cache_salt`,
+receive zero cache credit. LoRA names use the shared index's hash namespace.
+Event interpretation and cache-identity semantics follow the shared upstream index.
+
+The cost model keeps its character units. For a prompt of `L` characters and
+`N` prepared tokens, `H` reusable tokens become `floor(L * H / N)` equivalent
+cached characters. This is a cost approximation based on event-derived token
+residency; it does not recover exact token-to-character offsets. Existing cost
+coefficients, TTFT budgets and rate parameters keep their meaning. Online rate
+learning uses requests with observed event-prefix evidence; zero-match requests
+release their pending work without training the rate, since the shared query
+does not distinguish a cold miss from unavailable cache state. A configured
+`PREFILL_RATE` remains fixed. Tree size and eviction settings apply only to
+the request-history path.
+
+Multimodal chat parts and tool results, unrecognized message roles,
+batched/token-ID completion prompts and other endpoints fall back to
+**least-inflight balancing**, with rotating ties among available
+workers. They do not populate the prefix tree or train prefill rates. Native HTTP
+forwarding preserves unsupported content parts; the token-ID-only gRPC path
+still rejects multimodal input.
+Re-encoded PD JSON responses regenerate body-length and framing headers.
+
+Each policy instance warns once for each fixed input category: non-text chat,
+batched or token-ID prompts, and unsupported endpoints or missing typed prompts.
+Subsequent fallbacks in the same category log at debug level. Both levels include
+`route`, input category, `fallback=least_inflight` and `selected_worker`, without
+logging the input payload. SMetric request load
+is released on completion, error or cancellation; retry attempts own separate
+load reservations. This does not change Power-of-Two load accounting.
+
+The [archived reproduction](https://github.com/clateral912/smetric-router-repro)
+contains a historical Power-of-Two **zero-load/load-feedback-limited baseline**.
+It is not a measurement of a fully load-aware Power-of-Two implementation.
+Correcting that baseline and remeasuring it are separate from this SMetric PR;
+archived figures are unchanged.
+
+---
+
+## KV Aware
+
+The `kv_aware` policy scores workers using the request's reusable KV blocks and current load. The default multiplicative selection is supported in regular, co-located routing mode only. In PD mode, prefill may use the SMetric selection described above; decode must use another supported policy. KV placement credit requires gRPC workers because the gRPC chat route supplies token IDs to the policy. With HTTP workers, the default selection uses load-only scoring, while SMetric selection uses the request-history Tree.
+
+```bash
+vllm-router --policy kv_aware \
+  --router-temperature 0.2 \
+  --kv-penalty-host 0.8 \
+  --kv-penalty-external 0.6 \
+  --kv-penalty-disk 0.3 \
+  --worker-urls grpc://worker1:8000 grpc://worker2:8000
+```
+
+For each candidate, the scorer computes `ptoken = new_prefill_tokens + active_prefill_tokens` and projects the request count as `max(slot_manager.active_requests, Worker::load) + 1`. It multiplies `ptoken` by that projected count, so the score estimates the load after admitting this request and includes its remaining prefill work even when the worker is currently idle. Zero-cost cases, such as a request with no prefill work, are resolved by the KV-work and current-load tie-breaks.
+
+`--router-temperature 0` selects a minimum-cost worker. A positive temperature samples among candidates by their relative costs. Device reuse has full credit; the host, external, and disk `--kv-penalty-*` flags configure transfer-credit ratios for those tiers. A higher credit means more reuse value and lower transfer cost.
 
 ---
 
