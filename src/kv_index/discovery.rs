@@ -431,6 +431,64 @@ async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDi
         };
     }
     let server_info = query_server_info(client, worker_url).await;
+    let sources = query_kv_event_sources(client, worker_url).await;
+    if sources.is_err() {
+        if let Some(base_port_str) = std::env::var("VLLM_ROUTER_KV_EVENTS_PORT_BASE").ok() {
+            if let Ok(kv_port_base) = base_port_str.parse::<u16>() {
+                let worker_port_base = std::env::var("VLLM_ROUTER_WORKER_PORT_BASE")
+                    .ok()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(8000);
+                let worker_port = worker_url
+                    .rsplit(':')
+                    .next()
+                    .and_then(|s| s.split('/').next())
+                    .and_then(|s| s.split('@').next())
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(worker_port_base);
+                let idx = worker_port.saturating_sub(worker_port_base);
+                let kv_port = kv_port_base + idx;
+                let block_size = std::env::var("VLLM_ROUTER_KV_BLOCK_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(16);
+                let topic = std::env::var("VLLM_ROUTER_KV_TOPIC")
+                    .ok()
+                    .unwrap_or_else(|| "kv@".to_string());
+                let model_id = std::env::var("VLLM_ROUTER_KV_MODEL_ID")
+                    .ok()
+                    .unwrap_or_else(|| "Qwen3-30B-A3B".to_string());
+                let host = worker_host(worker_url).unwrap_or_else(|| "127.0.0.1".to_string());
+                let mut map = KvEventSourcesResponse::new();
+                map.insert(
+                    "0".to_string(),
+                    KvEventSourceEntry {
+                        endpoint: format!("tcp://{host}:{kv_port}"),
+                        replay_endpoint: None,
+                        topic,
+                        hwm: Some(100_000),
+                        buffer_steps: Some(10_000),
+                        publisher: Some("zmq".to_string()),
+                        encoding: Some("msgpack".to_string()),
+                        schema_version: Some(1),
+                        enable_kv_cache_events: Some(true),
+                    },
+                );
+                return WorkerDiscovery {
+                    default_rank: Some(0),
+                    server_info: Ok(ServerInfo {
+                        model_id: Some(model_id.clone()),
+                        instance_id: Some(worker_url.to_string()),
+                        kv_block_size: Some(block_size),
+                        effective_attention_block_size: Some(block_size),
+                        ..Default::default()
+                    }),
+                    sources: Ok(map),
+                    model_id: Ok(Some(model_id)),
+                };
+            }
+        }
+    }
     let model_id = server_info
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
@@ -438,7 +496,7 @@ async fn discover_worker(client: &reqwest::Client, worker_url: &str) -> WorkerDi
     WorkerDiscovery {
         default_rank: None,
         server_info,
-        sources: query_kv_event_sources(client, worker_url).await,
+        sources,
         model_id,
     }
 }

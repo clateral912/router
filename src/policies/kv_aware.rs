@@ -1010,7 +1010,9 @@ impl KvAwareOps for KvAwarePolicy {
     }
 
     fn allows_worker_discovery(&self, worker_url: &str) -> bool {
-        self.smetric.is_none() || crate::backend::is_grpc_url(worker_url)
+        self.smetric.is_none()
+            || crate::backend::is_grpc_url(worker_url)
+            || std::env::var_os("VLLM_ROUTER_KV_EVENTS_PORT_BASE").is_some()
     }
 
     fn select_request_with_receipt(

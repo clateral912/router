@@ -139,6 +139,10 @@ impl RequestLoadGuard {
         self.state.tracker.lock().is_some()
     }
 
+    fn has_kv_slot(&self) -> bool {
+        self.state.kv_slot.is_some()
+    }
+
     fn discard_tracker(&self) {
         self.state.tracker.lock().take();
     }
@@ -234,7 +238,7 @@ impl futures_util::Stream for LoadTrackedBody {
                     self.load.begin_slot_decode();
                 }
             } else if self.observe_sse {
-                if self.load.has_tracker() {
+                if self.load.has_tracker() || self.load.has_kv_slot() {
                     let step = self.first_token.observe_stream(bytes);
                     if step.outputs > 0 {
                         self.load.on_output_tokens(step.outputs);
@@ -242,8 +246,6 @@ impl futures_util::Stream for LoadTrackedBody {
                     if step.ended {
                         self.load.discard_tracker();
                     }
-                } else {
-                    self.load.begin_slot_decode();
                 }
             }
         }
@@ -336,6 +338,17 @@ struct SelectedWorker {
     tracker: Option<RequestTracker>,
 }
 
+#[derive(Clone, Default)]
+struct HttpKvTokenizer(Option<Arc<dyn crate::tokenizer::traits::Encoder>>);
+
+impl std::fmt::Debug for HttpKvTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HttpKvTokenizer")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
@@ -351,6 +364,7 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
+    http_kv_tokenizer: HttpKvTokenizer,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
@@ -595,6 +609,19 @@ impl Router {
             }))
         });
 
+        let http_kv_tokenizer = HttpKvTokenizer(
+            if let Ok(tok_path) = std::env::var("VLLM_ROUTER_KV_EVENTS_TOKENIZER") {
+                let tok = crate::tokenizer::create_tokenizer_async(&tok_path)
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to load VLLM_ROUTER_KV_EVENTS_TOKENIZER {tok_path}: {e}")
+                    })?;
+                Some(tok as Arc<dyn crate::tokenizer::traits::Encoder>)
+            } else {
+                None
+            },
+        );
+
         Ok(Router {
             epd: ctx
                 .router_config
@@ -614,6 +641,7 @@ impl Router {
             circuit_breaker_config: core_cb_config,
             health_config,
             frontend,
+            http_kv_tokenizer,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             kv_index_supervisor,
@@ -1452,20 +1480,49 @@ impl Router {
             .needs_affinity_prompt()
             .then(|| typed_req.extract_affinity_prompt())
             .flatten();
+        let http_kv_token_ids = if prepared.is_none() {
+            if let Some(tokenizer) = &self.http_kv_tokenizer.0 {
+                let raw_text = prompt
+                    .as_ref()
+                    .map(|p| p.text.clone())
+                    .unwrap_or_else(|| typed_req.extract_text_for_routing());
+                if !raw_text.is_empty() {
+                    tokenizer
+                        .encode(&raw_text)
+                        .ok()
+                        .map(|enc| enc.token_ids().to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let context = RoutingContext {
             prompt: prompt.as_ref(),
             allow_affinity: typed_req.allows_cache_affinity()
                 && header_utils::allows_affinity_for_turn(headers),
             colocated: true,
             route,
-            kv: prepared.as_ref().map(|prepared| {
-                let (lora_name, cache_salt) = Self::prepared_cache_identity(Some(prepared));
-                KvRequestContext {
-                    token_ids: prepared.tokenized.token_ids.as_ref(),
-                    lora_name,
-                    cache_salt,
-                }
-            }),
+            kv: prepared
+                .as_ref()
+                .map(|prepared| {
+                    let (lora_name, cache_salt) = Self::prepared_cache_identity(Some(prepared));
+                    KvRequestContext {
+                        token_ids: prepared.tokenized.token_ids.as_ref(),
+                        lora_name,
+                        cache_salt,
+                    }
+                })
+                .or_else(|| {
+                    http_kv_token_ids.as_deref().map(|token_ids| KvRequestContext {
+                        token_ids,
+                        lora_name: None,
+                        cache_salt: None,
+                    })
+                }),
         };
         let text = if policy.needs_affinity_prompt() {
             String::new()
@@ -1537,9 +1594,7 @@ impl Router {
                         model_id,
                         Some(&text),
                         headers,
-                        prepared
-                            .as_ref()
-                            .map(|prepared| prepared.tokenized.token_ids.as_ref()),
+                        context.kv.as_ref().map(|kv| kv.token_ids),
                         lora_name,
                         cache_salt,
                         Some(&context),
@@ -1561,8 +1616,47 @@ impl Router {
                     }
                 };
 
+                static DECISION_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DECISION_LOG.get_or_init(|| std::env::var_os("SMETRIC_DECISION_LOG").is_some()) {
+                    let request_id = headers
+                        .and_then(|h| h.get("x-request-id"))
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let session_id = headers
+                        .and_then(|h| h.get("x-session-id"))
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let turn = headers
+                        .and_then(|h| h.get("x-session-turn"))
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let (ptoken, batchsize, cost) = kv_receipt
+                        .as_ref()
+                        .map(|r| {
+                            (
+                                Some(r.decision.components.ptoken),
+                                Some(r.decision.components.batchsize),
+                                Some(r.decision.cost),
+                            )
+                        })
+                        .unwrap_or((None, None, None));
+                    eprintln!(
+                        "ROUTING_DECISION_JSON {}",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "turn": turn,
+                            "selected_worker": worker.url(),
+                            "policy": policy.name(),
+                            "ptoken": ptoken,
+                            "batchsize": batchsize,
+                            "cost": cost,
+                        })
+                    );
+                }
+
                 let kv_slot = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
-                    prepared.as_ref()?;
+                    context.kv.as_ref()?;
                     kv_aware.begin_request(kv_receipt?)
                 });
 
@@ -1582,7 +1676,7 @@ impl Router {
                 let load = RequestLoadGuard::new(load_incremented.then(|| worker.clone()), kv_slot)
                     .with_tracker(tracker);
 
-                let response = self
+                let mut response = self
                     .send_typed_request(
                         typed_req,
                         TypedDispatch {
@@ -1596,6 +1690,10 @@ impl Router {
                         program_completion.clone(),
                     )
                     .await;
+
+                if let Ok(val) = HeaderValue::from_str(worker.url()) {
+                    response.headers_mut().insert("x-routed-instance", val);
+                }
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker.
@@ -3317,6 +3415,7 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            http_kv_tokenizer: HttpKvTokenizer(None),
         }
     }
 
@@ -3351,6 +3450,7 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            http_kv_tokenizer: HttpKvTokenizer(None),
         }
     }
 
@@ -4314,6 +4414,7 @@ mod tests {
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+            http_kv_tokenizer: HttpKvTokenizer(None),
         }
     }
 

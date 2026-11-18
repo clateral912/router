@@ -29,6 +29,7 @@ const BETA_MIN_BUCKET_SAMPLES: usize = 2;
 pub(super) struct SMetricStrategy {
     config: SMetricConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    model_rates: DashMap<String, Arc<Mutex<RateHistory>>>,
     model_betas: DashMap<String, Arc<BetaState>>,
     round_robin: AtomicUsize,
     states: DashMap<usize, Arc<WorkerState>>,
@@ -77,6 +78,7 @@ impl SMetricStrategy {
         Self {
             config,
             trees,
+            model_rates: DashMap::new(),
             model_betas: DashMap::new(),
             states: DashMap::new(),
             retired: RwLock::new(HashMap::new()),
@@ -85,6 +87,37 @@ impl SMetricStrategy {
             eviction_shutdown,
             eviction_handle,
         }
+    }
+
+    fn effective_rate(
+        &self,
+        worker: &Arc<dyn Worker>,
+        state: Option<&WorkerState>,
+    ) -> Option<(f64, f64, bool)> {
+        if let Some(fixed) = self.config.prefill_rate {
+            return Some((0.0, fixed, false));
+        }
+        let worker_snap = state.map(|s| {
+            let r = s.rates.lock();
+            (r.tau_0, r.rate, r.affine_excited)
+        });
+        if let Some((tau_0, Some(r), true)) = worker_snap {
+            return Some((tau_0, r, true));
+        }
+        let pool_snap = self.model_rates.get(worker.model_id()).map(|pr| {
+            let r = pr.lock();
+            (r.tau_0, r.rate, r.affine_excited)
+        });
+        if let Some((tau_0, Some(r), true)) = pool_snap {
+            return Some((tau_0, r, true));
+        }
+        if let Some((_, Some(r), _)) = worker_snap {
+            return Some((0.0, r, false));
+        }
+        if let Some((_, Some(r), _)) = pool_snap {
+            return Some((0.0, r, false));
+        }
+        None
     }
 
     fn effective_beta(&self, worker: &Arc<dyn Worker>, state: Option<&WorkerState>) -> f64 {
@@ -147,19 +180,24 @@ impl SMetricStrategy {
             let coloc_load = if colocated { worker_load } else { 0 };
             let batch_factor = (coloc_load as u64).saturating_add(1);
             let prefill_work = queued.saturating_mul(batch_factor);
-            let rate = self
-                .config
-                .prefill_rate
-                .or_else(|| state.as_ref().and_then(|s| s.rates.lock().rate));
+            let eff_rate = self.effective_rate(worker, state.as_deref().map(Arc::as_ref));
             let beta = if colocated {
                 self.effective_beta(worker, state.as_deref().map(Arc::as_ref))
             } else {
                 0.0
             };
             let decode_fraction = beta * (coloc_load as f64);
-            let phi = rate
-                .filter(|&r| r > 0.0 && budget > 0.0)
-                .map(|r| (prefill_work as f64) / (r * budget) + decode_fraction);
+            let phi = eff_rate
+                .filter(|&(_, r, _)| r > 0.0 && budget > 0.0)
+                .map(|(tau_0, r, _)| {
+                    let prefill_fraction = if prefill_work == 0 {
+                        0.0
+                    } else {
+                        let headroom = (budget - tau_0).max(1e-6);
+                        (prefill_work as f64) / (r * headroom)
+                    };
+                    prefill_fraction + decode_fraction
+                });
             let meets = phi.map_or(decode_fraction <= 1.0, |p| p <= 1.0);
             any_meets_slo |= meets;
             let score = match phi {
@@ -199,15 +237,76 @@ impl SMetricStrategy {
             }
         }
         let (prev_idx, hit, prev_cost, prev_meets, prev_score, prev_pwork) = prev?;
-        let (min_idx, _, _, min_pwork, _, _, min_score, min_cost) = min?;
-        let (idx, cost, score, sample_work) = if passes_turn_gate
+        let (min_idx, _, min_phi, min_pwork, min_coloc_load, _, min_score, min_cost) = min?;
+        let affinity_keep = passes_turn_gate
             && (hit as f64) > self.config.hit_ratio * prompt.est_hit_chars as f64
-            && (prev_meets || !any_meets_slo)
-        {
+            && (prev_meets || !any_meets_slo);
+        let (idx, cost, score, sample_work) = if affinity_keep {
             (prev_idx, prev_cost, prev_score, prev_pwork)
         } else {
             (min_idx, min_cost, min_score, min_pwork)
         };
+        static DECISION_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DECISION_LOG.get_or_init(|| std::env::var_os("SMETRIC_DECISION_LOG").is_some()) {
+            let sel_worker = &workers[idx];
+            let sel_state = self.states.get(&Self::instance_id(sel_worker));
+            let eff_rate = if self.config.prefill_rate.is_none() {
+                self.effective_rate(sel_worker, sel_state.as_deref().map(Arc::as_ref))
+            } else {
+                None
+            };
+            let learned_rate = eff_rate.map(|(_, r, _)| r);
+            let learned_tau0 = eff_rate.map(|(tau_0, _, _)| tau_0);
+            let affine_excited = eff_rate.map(|(_, _, exc)| exc);
+            let worker_secant_p50 = sel_state.as_ref().and_then(|s| s.rates.lock().p50_secant);
+            let worker_beta = sel_state.as_ref().and_then(|s| s.beta.get());
+            let pool_beta = self
+                .model_betas
+                .get(sel_worker.model_id())
+                .and_then(|b| b.get());
+            let eff_beta = if colocated {
+                self.effective_beta(sel_worker, sel_state.as_deref().map(Arc::as_ref))
+            } else {
+                0.0
+            };
+            let sel_load = loads.map_or_else(|| sel_worker.load(), |ls| ls[idx]);
+            let reason = if !passes_turn_gate {
+                "turn_gate"
+            } else if (hit as f64) <= self.config.hit_ratio * prompt.est_hit_chars as f64 {
+                "low_hit"
+            } else if affinity_keep {
+                if idx == prev_idx && prev_meets {
+                    "affinity_keep"
+                } else {
+                    "overload_keep"
+                }
+            } else {
+                "slo_overflow_migrate"
+            };
+            eprintln!(
+                "SMETRIC_DECISION_JSON {}",
+                serde_json::json!({
+                    "selected_worker": sel_worker.url(),
+                    "prev_worker": workers[prev_idx].url(),
+                    "min_worker": workers[min_idx].url(),
+                    "reason": reason,
+                    "l_chars": l,
+                    "hit_chars": hit,
+                    "cost": cost,
+                    "score": score,
+                    "selected_load": sel_load,
+                    "min_coloc_load": min_coloc_load,
+                    "min_phi": min_phi,
+                    "learned_rate_p50": learned_rate,
+                    "learned_tau0": learned_tau0,
+                    "affine_rate_excited": affine_excited,
+                    "worker_secant_p50": worker_secant_p50,
+                    "worker_beta": worker_beta,
+                    "pool_beta": pool_beta,
+                    "effective_beta": eff_beta,
+                })
+            );
+        }
         if !prompt.text.is_empty() && event_hits.is_none() {
             self.trees
                 .entry(workers[idx].model_id().to_string())
@@ -216,14 +315,16 @@ impl SMetricStrategy {
         }
         RouterMetrics::record_processed_request(workers[idx].url());
         RouterMetrics::record_policy_decision("kv_aware", workers[idx].url());
-        let selected_rate = self.config.prefill_rate.or_else(|| {
-            self.states
-                .get(&Self::instance_id(&workers[idx]))
-                .and_then(|s| s.rates.lock().rate)
-        });
-        let est_prefill = selected_rate.filter(|&r| r > 0.0).map(|r| {
-            Duration::from_secs_f64(((sample_work as f64) / r).clamp(0.001, budget.max(0.05)))
-        });
+        let selected_state = self.states.get(&Self::instance_id(&workers[idx]));
+        let selected_rate =
+            self.effective_rate(&workers[idx], selected_state.as_deref().map(Arc::as_ref));
+        let est_prefill = selected_rate
+            .filter(|&(_, r, _)| r > 0.0)
+            .map(|(tau_0, r, _)| {
+                Duration::from_secs_f64(
+                    (tau_0 + (sample_work as f64) / r).clamp(0.001, budget.max(0.05)),
+                )
+            });
         let tracker = self.track_with_sample(&workers[idx], cost, sample_work, est_prefill);
         let skip_rate_sample = event_hits.as_ref().is_some_and(|hits| {
             let h = &hits[idx];
@@ -254,6 +355,13 @@ impl SMetricStrategy {
             .get(&Self::instance_id(worker))
             .map(|s| s.clone())
             .unwrap_or_else(|| {
+                let learn_rate = self.config.prefill_rate.is_none();
+                let pool_rates = learn_rate.then(|| {
+                    self.model_rates
+                        .entry(worker.model_id().to_string())
+                        .or_insert_with(|| Arc::new(Mutex::new(RateHistory::new(POOL_RATE_WINDOW))))
+                        .clone()
+                });
                 let learn_beta = self.config.decode_weight.is_none();
                 let pool_beta = learn_beta.then(|| {
                     self.model_betas
@@ -269,10 +377,11 @@ impl SMetricStrategy {
                             model_id: worker.model_id().to_string(),
                             pending: AtomicU64::new(0),
                             rates: Mutex::new(RateHistory::default()),
+                            pool_rates,
                             beta: BetaState::new(),
                             pool_beta,
                             tpot_slo: self.config.tpot_slo,
-                            learn_rate: self.config.prefill_rate.is_none(),
+                            learn_rate,
                             learn_beta,
                         })
                     })
@@ -320,8 +429,12 @@ impl Drop for SMetricStrategy {
     }
 }
 
-const RATE_WINDOW: usize = 64;
+const RATE_WINDOW: usize = 128;
+const POOL_RATE_WINDOW: usize = 256;
 const RATE_MIN_SAMPLES: usize = 8;
+const RATE_MIN_BUCKET_SAMPLES: usize = 3;
+const RATE_MIN_AFFINE_BUCKETS: usize = 3;
+const RATE_MAX_SECANT_MULTIPLE: f64 = 8.0;
 
 fn sorted_median(sorted: &[f64]) -> f64 {
     let mid = sorted.len() / 2;
@@ -332,26 +445,138 @@ fn sorted_median(sorted: &[f64]) -> f64 {
     }
 }
 
-#[derive(Debug, Default)]
+fn weighted_median(pairs: &mut [(f64, f64)]) -> f64 {
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: f64 = pairs.iter().map(|(_, w)| *w).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let half = 0.5 * total;
+    let mut acc = 0.0;
+    for &(val, w) in pairs.iter() {
+        acc += w;
+        if acc >= half {
+            return val;
+        }
+    }
+    pairs.last().map_or(0.0, |&(val, _)| val)
+}
+
+/// Online estimator of the affine prefill latency law:
+/// `TTFT(W) = tau_0 + W / R_marginal`
+/// symmetric to `BetaState`'s `TPOT(b) = tau_1 + delta_tau * b`.
+/// Groups `(W, TTFT)` observations into `log2(W)` octave buckets (`n >= 3` per bucket
+/// for single-outlier breakdown resistance) and fits a log-octave support-weighted
+/// Theil-Sen slope across `>= 3` buckets spanning `>= 4x` dynamic range, falling
+/// back to the `p50` secant rate `(tau_0 = 0, R = median(W / TTFT))` until excited.
+#[derive(Debug)]
 struct RateHistory {
-    samples: VecDeque<f64>,
+    window: usize,
+    samples: VecDeque<(f64, f64)>,
+    tau_0: f64,
     rate: Option<f64>,
+    p50_secant: Option<f64>,
+    affine_excited: bool,
+}
+
+impl Default for RateHistory {
+    fn default() -> Self {
+        Self::new(RATE_WINDOW)
+    }
 }
 
 impl RateHistory {
-    fn record(&mut self, rate: f64) {
-        if !rate.is_finite() || rate <= 0.0 {
+    fn new(window: usize) -> Self {
+        Self {
+            window,
+            samples: VecDeque::with_capacity(window),
+            tau_0: 0.0,
+            rate: None,
+            p50_secant: None,
+            affine_excited: false,
+        }
+    }
+
+    fn record_observation(&mut self, work: f64, elapsed_secs: f64) {
+        if !work.is_finite() || work <= 0.0 || !elapsed_secs.is_finite() || elapsed_secs <= 0.0 {
             return;
         }
-        if self.samples.len() == RATE_WINDOW {
+        if self.samples.len() == self.window {
             self.samples.pop_front();
         }
-        self.samples.push_back(rate);
-        if self.samples.len() >= RATE_MIN_SAMPLES {
-            let mut sorted: Vec<_> = self.samples.iter().copied().collect();
-            sorted.sort_by(f64::total_cmp);
-            self.rate = Some(sorted_median(&sorted));
+        self.samples.push_back((work, elapsed_secs));
+        if self.samples.len() < RATE_MIN_SAMPLES {
+            return;
         }
+
+        let mut secants: Vec<f64> = self.samples.iter().map(|&(w, t)| w / t).collect();
+        secants.sort_by(f64::total_cmp);
+        let p50_sec = sorted_median(&secants);
+        self.p50_secant = Some(p50_sec);
+
+        let mut by_octave: BTreeMap<i32, Vec<(f64, f64)>> = BTreeMap::new();
+        for &(w, t) in &self.samples {
+            let b = w.max(1.0).log2().floor() as i32;
+            by_octave.entry(b).or_default().push((w, t));
+        }
+
+        let mut buckets: Vec<(f64, f64, usize)> = Vec::with_capacity(by_octave.len());
+        for (_, pts) in by_octave {
+            if pts.len() < RATE_MIN_BUCKET_SAMPLES {
+                continue;
+            }
+            let mut ws: Vec<f64> = pts.iter().map(|&(w, _)| w).collect();
+            let mut ts: Vec<f64> = pts.iter().map(|&(_, t)| t).collect();
+            ws.sort_by(f64::total_cmp);
+            ts.sort_by(f64::total_cmp);
+            buckets.push((sorted_median(&ws), sorted_median(&ts), pts.len()));
+        }
+
+        if buckets.len() >= RATE_MIN_AFFINE_BUCKETS {
+            let min_w = buckets.first().map_or(0.0, |b| b.0);
+            let max_w = buckets.last().map_or(0.0, |b| b.0);
+            if min_w > 0.0 && max_w >= 4.0 * min_w {
+                let mut slope_pairs: Vec<(f64, f64)> = Vec::new();
+                for i in 0..buckets.len() {
+                    let (mw_i, mt_i, n_i) = buckets[i];
+                    for &(mw_j, mt_j, n_j) in &buckets[(i + 1)..] {
+                        if mw_j >= 2.0 * mw_i {
+                            let slope = (mt_j - mt_i) / (mw_j - mw_i);
+                            let weight = (n_i.min(n_j) as f64) * (mw_j / mw_i).ln();
+                            if slope.is_finite() && weight > 0.0 {
+                                slope_pairs.push((slope, weight));
+                            }
+                        }
+                    }
+                }
+                if !slope_pairs.is_empty() {
+                    let s_med = weighted_median(&mut slope_pairs);
+                    if s_med > 1e-12 {
+                        let r_marg =
+                            (1.0 / s_med).clamp(p50_sec, RATE_MAX_SECANT_MULTIPLE * p50_sec);
+                        let s_eff = 1.0 / r_marg;
+                        let mut intercepts: Vec<(f64, f64)> = buckets
+                            .iter()
+                            .map(|&(mw, mt, n)| (mt - s_eff * mw, n as f64))
+                            .collect();
+                        let tau_0 = weighted_median(&mut intercepts).max(0.0);
+                        self.tau_0 = tau_0;
+                        self.rate = Some(r_marg);
+                        self.affine_excited = true;
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.tau_0 = 0.0;
+        self.rate = Some(p50_sec);
+        self.affine_excited = false;
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, rate: f64) {
+        self.record_observation(rate, 1.0);
     }
 }
 
@@ -445,6 +670,7 @@ struct WorkerState {
     model_id: String,
     pending: AtomicU64,
     rates: Mutex<RateHistory>,
+    pool_rates: Option<Arc<Mutex<RateHistory>>>,
     beta: BetaState,
     pool_beta: Option<Arc<BetaState>>,
     tpot_slo: f64,
@@ -474,9 +700,12 @@ impl RequestObserver for WorkerState {
         if let Some(elapsed) =
             elapsed.filter(|elapsed| self.learn_rate && sample_work > 0 && !elapsed.is_zero())
         {
-            self.rates
-                .lock()
-                .record(sample_work as f64 / elapsed.as_secs_f64());
+            let w = sample_work as f64;
+            let secs = elapsed.as_secs_f64();
+            self.rates.lock().record_observation(w, secs);
+            if let Some(pool_rates) = &self.pool_rates {
+                pool_rates.lock().record_observation(w, secs);
+            }
         }
     }
 
@@ -512,6 +741,7 @@ impl SMetricStrategy {
             .any(|entry| entry.value().model_id == model_id)
         {
             self.model_betas.remove(model_id);
+            self.model_rates.remove(model_id);
         }
         self.trees.remove_if(model_id, |_, tree| {
             tree.remove_tenant(&Self::tenant_key(worker));
@@ -1561,5 +1791,79 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1));
         bound_tracker.on_first_token();
         assert_eq!(state.rates.lock().samples.len(), 1);
+    }
+
+    #[test]
+    fn rate_history_affine_estimator_recovers_tau0_and_marginal_rate_and_enables_cold_evacuation() {
+        // Ground-truth affine law: TTFT(W) = 0.65s + W / 2_000_000.0
+        let mut hist = RateHistory::default();
+        // Bucket 2^18 (W = 400_000 => TTFT = 0.85s), dominated by small cache-hit turns + 1 stall outlier
+        hist.record_observation(400_000.0, 0.85);
+        hist.record_observation(400_000.0, 0.85);
+        hist.record_observation(400_000.0, 15.0);
+        // More small cache-hit turns so secant median stays dominated by small-W overhead (~470k/s)
+        for _ in 0..4 {
+            hist.record_observation(400_000.0, 0.85);
+        }
+        // Bucket 2^20 (W = 1_600_000 => TTFT = 1.45s)
+        for _ in 0..3 {
+            hist.record_observation(1_600_000.0, 1.45);
+        }
+        // Bucket 2^22 (W = 6_400_000 => TTFT = 3.85s) + 1 fast remote-hit outlier (0.30s)
+        hist.record_observation(6_400_000.0, 3.85);
+        hist.record_observation(6_400_000.0, 3.85);
+        hist.record_observation(6_400_000.0, 0.30);
+
+        assert!(hist.affine_excited);
+        let r_marg = hist.rate.unwrap();
+        assert!(
+            (r_marg - 2_000_000.0).abs() < 1e-3,
+            "expected R_marginal = 2_000_000, got {r_marg}"
+        );
+        assert!(
+            (hist.tau_0 - 0.65).abs() < 1e-3,
+            "expected tau_0 = 0.65, got {}",
+            hist.tau_0
+        );
+        assert!(
+            hist.p50_secant.unwrap() < 1_000_000.0,
+            "secant p50 should remain suppressed by tau_0 on small turns"
+        );
+
+        // Verify routing impact: warm worker 0 is decode-saturated (B=3, beta=0.36 => 1.08 > 1.0),
+        // cold worker 1 has W_cold = 6_000_000 under budget = 4.4s.
+        // Affine model predicts 0.65 + 6.0M / 2.0M = 3.65s <= 4.4s (feasible -> evacuate to worker 1!).
+        let policy = SMetricStrategy::new(
+            serde_yaml::from_str(
+                "C_LIN: 100000\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 4.4\nTTFT_SLO_PER_CHAR: 0\nDECODE_WEIGHT: 0.36\nEVICTION_INTERVAL_SECS: 0\n",
+            )
+            .unwrap(),
+        );
+        let workers: Vec<Arc<dyn Worker>> = ["http://warm", "http://cold"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        // Seed 55-char history on warm worker 0, then add 5 new chars (total L = 60 => cold cost = 6_000_000).
+        let prefix = "a".repeat(55);
+        drop(select(&policy, &workers, &prompt(&prefix, 0), false, true));
+        *policy
+            .model_rates
+            .entry(workers[0].model_id().to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(RateHistory::new(POOL_RATE_WINDOW))))
+            .lock() = hist;
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+        let next = format!("{prefix}bbbbb");
+        let chosen = select(&policy, &workers, &prompt(&next, 55), true, true).0;
+        assert_eq!(
+            chosen, 1,
+            "affine prefill model must recognize idle cold worker as SLO-feasible and shed overflow"
+        );
+        for _ in 0..3 {
+            workers[0].decrement_load();
+        }
     }
 }

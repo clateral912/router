@@ -55,7 +55,8 @@ impl Serialize for ExternalBlockHash {
     }
 }
 
-/// A KV cache event. vLLM tags each with the class name under `"type"`.
+/// A KV cache event. vLLM tags each with the class name under `"type"` (map mode)
+/// or as the leading element of a positional `msgspec.Struct(array_like=True, tag=True)` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum KVEvent {
@@ -65,6 +66,100 @@ pub enum KVEvent {
     BlockRemoved(BlockRemoved),
     #[serde(rename = "AllBlocksCleared")]
     AllBlocksCleared(AllBlocksCleared),
+}
+
+struct WireKVEvent(KVEvent);
+
+impl<'de> Deserialize<'de> for WireKVEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{self, MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct KVEventVisitor;
+        impl<'de> Visitor<'de> for KVEventVisitor {
+            type Value = WireKVEvent;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a tagged KVEvent map or vLLM msgspec array-like KVEvent")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut entries = Vec::new();
+                while let Some((k, v)) = map.next_entry::<rmpv::Value, rmpv::Value>()? {
+                    if !v.is_nil() {
+                        entries.push((k, v));
+                    }
+                }
+                let cleaned = rmpv::Value::Map(entries);
+                let ev = rmpv::ext::from_value::<KVEvent>(cleaned).map_err(de::Error::custom)?;
+                Ok(WireKVEvent(ev))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let tag: rmpv::Value = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::custom("empty KVEvent array"))?;
+                let is_stored = tag.as_str() == Some("BlockStored") || tag.as_u64() == Some(0);
+                let is_removed = tag.as_str() == Some("BlockRemoved") || tag.as_u64() == Some(1);
+                let is_cleared =
+                    tag.as_str() == Some("AllBlocksCleared") || tag.as_u64() == Some(2);
+                if is_stored {
+                    let block_hashes: Vec<ExternalBlockHash> = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::custom("missing block_hashes"))?;
+                    let parent_block_hash: Option<ExternalBlockHash> =
+                        seq.next_element()?.unwrap_or(None);
+                    let token_ids: Vec<u32> = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::custom("missing token_ids"))?;
+                    let block_size: u32 = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::custom("missing block_size"))?;
+                    let lora_id: Option<i64> = seq.next_element()?.unwrap_or(None);
+                    let medium: Option<String> = seq.next_element()?.unwrap_or(None);
+                    let lora_name: Option<String> = seq.next_element()?.unwrap_or(None);
+                    let extra_keys: Option<Vec<rmpv::Value>> = seq.next_element()?.unwrap_or(None);
+                    while let Some(_ignored) = seq.next_element::<rmpv::Value>()? {}
+                    Ok(WireKVEvent(KVEvent::BlockStored(BlockStored {
+                        extra_keys,
+                        block_hashes,
+                        parent_block_hash,
+                        token_ids,
+                        block_size,
+                        lora_id,
+                        medium,
+                        lora_name,
+                        group_idx: None,
+                        kv_cache_spec_kind: None,
+                        kv_cache_spec_sliding_window: None,
+                        locality: None,
+                        ownership: None,
+                        session_id: None,
+                    })))
+                } else if is_removed {
+                    let block_hashes: Vec<ExternalBlockHash> = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::custom("missing block_hashes"))?;
+                    let medium: Option<String> = seq.next_element()?.unwrap_or(None);
+                    while let Some(_ignored) = seq.next_element::<rmpv::Value>()? {}
+                    Ok(WireKVEvent(KVEvent::BlockRemoved(BlockRemoved {
+                        block_hashes,
+                        medium,
+                        group_idx: None,
+                        locality: None,
+                        ownership: None,
+                    })))
+                } else if is_cleared {
+                    while let Some(_ignored) = seq.next_element::<rmpv::Value>()? {}
+                    Ok(WireKVEvent(KVEvent::AllBlocksCleared(AllBlocksCleared {})))
+                } else {
+                    Err(de::Error::custom(format!("unknown KVEvent tag: {tag:?}")))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(KVEventVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,9 +231,10 @@ impl<'de> Deserialize<'de> for KVEventBatch {
                 let ts: f64 = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::custom("missing ts"))?;
-                let events: Vec<KVEvent> = seq
+                let wire_events: Vec<WireKVEvent> = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::custom("missing events"))?;
+                let events = wire_events.into_iter().map(|w| w.0).collect();
                 let data_parallel_rank: Option<u32> = seq.next_element()?;
                 Ok(KVEventBatch {
                     ts,
@@ -266,5 +362,43 @@ mod tests {
         let back: KVEventBatch = from_slice(&buf).unwrap();
         assert_eq!(back.ts, 2.5);
         assert_eq!(back.data_parallel_rank, Some(1));
+    }
+
+    #[test]
+    fn vllm_018_positional_array_batch_decodes() {
+        // Exact msgspec.Struct(array_like=True, tag=True) bytes produced by vLLM 0.18.1:
+        // [1.0, [["BlockStored", [123], None, [1, 2, 3], 16, None, "GPU", None, None],
+        //        ["BlockRemoved", [123], "GPU"],
+        //        ["AllBlocksCleared"]], 0]
+        let raw: &[u8] = &[
+            0x93, 0xcb, 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x93, 0x99, 0xab, 0x42,
+            0x6c, 0x6f, 0x63, 0x6b, 0x53, 0x74, 0x6f, 0x72, 0x65, 0x64, 0x91, 0x7b, 0xc0, 0x93,
+            0x01, 0x02, 0x03, 0x10, 0xc0, 0xa3, 0x47, 0x50, 0x55, 0xc0, 0xc0, 0x93, 0xac, 0x42,
+            0x6c, 0x6f, 0x63, 0x6b, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x64, 0x91, 0x7b, 0xa3,
+            0x47, 0x50, 0x55, 0x91, 0xb0, 0x41, 0x6c, 0x6c, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x73,
+            0x43, 0x6c, 0x65, 0x61, 0x72, 0x65, 0x64, 0x00,
+        ];
+        let batch: KVEventBatch = from_slice(raw).unwrap();
+        assert_eq!(batch.ts, 1.0);
+        assert_eq!(batch.data_parallel_rank, Some(0));
+        assert_eq!(batch.events.len(), 3);
+        match &batch.events[0] {
+            KVEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![ExternalBlockHash::Int(123)]);
+                assert!(b.parent_block_hash.is_none());
+                assert_eq!(b.token_ids, vec![1, 2, 3]);
+                assert_eq!(b.block_size, 16);
+                assert_eq!(b.medium.as_deref(), Some("GPU"));
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+        match &batch.events[1] {
+            KVEvent::BlockRemoved(b) => {
+                assert_eq!(b.block_hashes, vec![ExternalBlockHash::Int(123)]);
+                assert_eq!(b.medium.as_deref(), Some("GPU"));
+            }
+            other => panic!("expected BlockRemoved, got {other:?}"),
+        }
+        assert!(matches!(batch.events[2], KVEvent::AllBlocksCleared(_)));
     }
 }
